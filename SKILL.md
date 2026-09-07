@@ -45,7 +45,13 @@ entera. Con una sola colección en ámbito, las páginas cuelgan directamente de
 el primer segmento de la ruta es la colección.
 
 Después, leer los `.md` de `wiki/` con las herramientas de ficheros normales.
-`wiki/INDEX.md` lista las páginas en el orden real de Outline, con su id al lado.
+Cada `.md` empieza con su `outline_id` en el frontmatter, que es el id que piden los endpoints.
+`.outline/index.md` lista las páginas en el orden real de Outline, con su id al lado.
+
+Junto a `wiki/` queda `.outline/`, que es estado de la máquina y no se edita a mano: el
+manifiesto con la revisión de cada página, la copia en la sombra del último `pull` en `base/`
+y ese índice.
+Se regenera entero con el `pull` siguiente.
 
 ## Escribir
 
@@ -64,7 +70,7 @@ API=$OUTLINE_URL/api
 ```
 
 **Página nueva.**
-Dónde colocarla se decide leyendo `wiki/INDEX.md`, que trae el árbol entero con títulos
+Dónde colocarla se decide leyendo `.outline/index.md`, que trae el árbol entero con títulos
 y jerarquía: basta para elegir colección y página padre sin preguntar.
 Lo normal es colgarla de la página con la que comparte tema, y dejarla en la raíz de la
 colección solo cuando abre un tema nuevo.
@@ -101,7 +107,7 @@ El `text` no debe empezar por un encabezado de nivel 1: el título es un campo a
 Los encabezados del cuerpo empiezan en `##`.
 
 **Página anidada.**
-Añadir `parentDocumentId` para que nazca colgando de otra página, con su id sacado de `wiki/INDEX.md`.
+Añadir `parentDocumentId` para que nazca colgando de otra página, con su id sacado de `.outline/index.md`.
 Cualquier documento puede ser padre, y la profundidad no está limitada.
 Las colecciones, en cambio, no se anidan entre sí: la jerarquía se construye siempre con documentos.
 

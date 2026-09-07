@@ -17,6 +17,8 @@ import urllib.request
 from pathlib import Path
 
 PAGE_SIZE = 100
+STATE_DIR = ".outline"
+FRONTMATTER = re.compile(r"\A---\n.*?\n---\n+", re.DOTALL)
 
 WINDOWS_RESERVED = {
     "con", "prn", "aux", "nul",
@@ -158,26 +160,48 @@ def scope(collections, root, todas):
     return matches, False
 
 
-def header(document, collection_name, base_url):
-    return "\n".join(
-        [
-            "<!--",
-            "AUTOGENERADO por outline.py. No editar a mano.",
-            "La fuente de verdad es Outline: los cambios locales se pierden al sincronizar.",
-            f"outline_id:  {document['id']}",
-            f"revision:    {document.get('revision')}",
-            f"updated_at:  {document.get('updatedAt')}",
-            f"collection:  {collection_name}",
-            f"url:         {base_url}{document.get('url', '')}",
-            "-->",
-            "",
-        ]
+def write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def frontmatter(document_id):
+    return f"---\noutline_id: {document_id}\n---\n\n"
+
+
+def strip_frontmatter(text):
+    return FRONTMATTER.sub("", text, count=1)
+
+
+def page_body(title, text):
+    stripped = (text or "").strip("\n")
+    return f"# {title}\n\n{stripped}\n" if stripped else f"# {title}\n"
+
+
+def manifest_path(root):
+    return root / STATE_DIR / "manifest.json"
+
+
+def read_manifest(root):
+    path = manifest_path(root)
+    if not path.is_file():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_manifest(root, documents, complete):
+    write(
+        manifest_path(root),
+        json.dumps(
+            {"pullComplete": complete, "documents": documents}, indent=2, ensure_ascii=False
+        )
+        + "\n",
     )
 
 
-def pull(client, base_url, root, todas):
+def pull(client, root, todas):
     wiki = root / "wiki"
-    manifest_path = wiki / ".outline-manifest.json"
+    base = root / STATE_DIR / "base"
 
     collections = list(client.paginate("collections.list", {}))
     selected, prefixed = scope(collections, root, todas)
@@ -189,15 +213,18 @@ def pull(client, base_url, root, todas):
         ):
             documents[item["id"]] = item
 
-    if wiki.exists():
-        shutil.rmtree(wiki)
-    wiki.mkdir(parents=True)
+    write_manifest(root, read_manifest(root).get("documents", {}), complete=False)
+
+    for directory in (wiki, base):
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir(parents=True)
 
     manifest = {}
     index_lines = []
     missing = []
 
-    def walk(nodes, directory, collection_name, depth):
+    def walk(nodes, relative_dir, collection_name, depth):
         for node in nodes:
             document = documents.get(node["id"])
             if document is None:
@@ -207,49 +234,40 @@ def pull(client, base_url, root, todas):
                 continue
 
             stem = slugify(node["title"])
-            if (directory / f"{stem}.md").exists():
+            if (wiki / relative_dir / f"{stem}.md").exists():
                 stem = f"{stem}-{document.get('urlId') or document['id'][:8]}"
-            path = directory / f"{stem}.md"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            body = document.get("text") or ""
-            title = document.get("title") or node["title"]
-            path.write_text(
-                header(document, collection_name, base_url) + f"# {title}\n\n" + body.lstrip("\n"),
-                encoding="utf-8",
-            )
+            relative = (relative_dir / f"{stem}.md").as_posix()
 
-            relative = path.relative_to(wiki).as_posix()
+            title = document.get("title") or node["title"]
+            body = page_body(title, document.get("text"))
+            write(wiki / relative, frontmatter(document["id"]) + body)
+            write(base / relative, body)
+
             manifest[document["id"]] = {
                 "path": relative,
-                "title": title,
                 "revision": document.get("revision"),
-                "updatedAt": document.get("updatedAt"),
                 "collection": collection_name,
-                "url": base_url + (document.get("url") or ""),
             }
-            index_lines.append(f"{'  ' * depth}- [{title}]({relative}) `{document['id']}`")
+            index_lines.append(f"{'  ' * depth}- [{title}](../wiki/{relative}) `{document['id']}`")
 
             if node.get("children"):
-                walk(node["children"], directory / stem, collection_name, depth + 1)
+                walk(node["children"], relative_dir / stem, collection_name, depth + 1)
 
     for collection in selected:
         name = collection["name"]
         tree = client.post("collections.documents", {"id": collection["id"]}).get("data") or []
         index_lines.append(f"\n## {name}\n")
-        walk(tree, wiki / slugify(name) if prefixed else wiki, name, 0)
+        walk(tree, Path(slugify(name)) if prefixed else Path(), name, 0)
 
-    manifest_path.write_text(
-        json.dumps({"baseUrl": base_url, "documents": manifest}, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    (wiki / "INDEX.md").write_text(
-        "# Indice de la wiki\n\n"
-        "Copia autogenerada de Outline. No editar nada de esta carpeta a mano.\n"
-        f"Fuente: {base_url}\n"
+    write(
+        root / STATE_DIR / "index.md",
+        "# Índice de la wiki\n\n"
+        "El árbol completo en el orden real de la barra lateral de Outline, que el árbol de\n"
+        "directorios no guarda. Lo genera `outline pull`; editarlo a mano no cambia nada.\n"
         + "\n".join(index_lines)
         + "\n",
-        encoding="utf-8",
     )
+    write_manifest(root, manifest, complete=not missing)
 
     ambito = "todas las colecciones" if prefixed else f"la colección {selected[0]['name']}"
     print(f"bajados {len(manifest)} documentos de {ambito} -> {wiki}")
@@ -259,13 +277,24 @@ def pull(client, base_url, root, todas):
 
 
 def load_manifest(root):
-    path = root / "wiki" / ".outline-manifest.json"
-    if not path.is_file():
-        fail(f"no hay manifiesto en {path}. Ejecuta 'outline pull' primero.")
-    return json.loads(path.read_text(encoding="utf-8"))["documents"]
+    state = read_manifest(root)
+    if not state:
+        fail(f"no hay manifiesto en {manifest_path(root)}. Ejecuta 'outline pull' primero.")
+    return state["documents"]
 
 
-def resolve(manifest, needle):
+def title_of(root, entry):
+    """El encabezado de nivel 1 de la página, o su ruta si falta o no lo lleva."""
+    path = root / "wiki" / entry["path"]
+    if path.is_file():
+        body = strip_frontmatter(path.read_text(encoding="utf-8")).lstrip("\n")
+        primera = body.split("\n", 1)[0]
+        if primera.startswith("# "):
+            return primera[2:].strip()
+    return entry["path"]
+
+
+def resolve(root, manifest, needle):
     """Acepta un id exacto, una ruta dentro de wiki/ o un trozo del título."""
     if needle in manifest:
         return needle
@@ -274,26 +303,31 @@ def resolve(manifest, needle):
         document_id
         for document_id, entry in manifest.items()
         if lowered in (entry["path"].lower(), Path(entry["path"]).stem.lower())
-        or lowered in entry["title"].lower()
+        or lowered in title_of(root, entry).lower()
     ]
     if not matches:
-        fail(f"'{needle}' no coincide con ninguna página. Las páginas están en wiki/INDEX.md")
+        fail(
+            f"'{needle}' no coincide con ninguna página. "
+            f"Las páginas están en {STATE_DIR}/index.md"
+        )
     if len(matches) > 1:
-        options = "\n".join(f"  {i} {manifest[i]['title']}" for i in matches)
+        options = "\n".join(f"  {i} {title_of(root, manifest[i])}" for i in matches)
         fail(f"'{needle}' coincide con {len(matches)} páginas:\n{options}")
     return matches[0]
 
 
 def check(client, root, needles):
     manifest = load_manifest(root)
-    targets = [resolve(manifest, needle) for needle in needles] if needles else list(manifest)
+    targets = (
+        [resolve(root, manifest, needle) for needle in needles] if needles else list(manifest)
+    )
     stale = 0
     for document_id in targets:
         local = manifest[document_id]
         remote = (client.post("documents.info", {"id": document_id}) or {}).get("data") or {}
         if remote.get("revision") != local["revision"]:
             print(
-                f"DESACTUALIZADO {local['title']}: local rev {local['revision']}, "
+                f"DESACTUALIZADO {title_of(root, local)}: local rev {local['revision']}, "
                 f"remoto rev {remote.get('revision')}"
             )
             stale += 1
@@ -323,12 +357,11 @@ def main(argv=None):
     parser.add_argument("--url", help="dirección de la instancia. Por defecto, OUTLINE_URL")
     arguments = parser.parse_args(argv)
 
-    url = read_url(arguments.url)
-    client = Outline(url, read_token())
+    client = Outline(read_url(arguments.url), read_token())
     root = project_root()
     if arguments.command == "check":
         return check(client, root, arguments.targets)
-    return pull(client, url, root, arguments.todas)
+    return pull(client, root, arguments.todas)
 
 
 if __name__ == "__main__":

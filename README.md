@@ -50,6 +50,32 @@ outline pull --all    # baja todas las colecciones
 outline check "..."   # compara revisiones sin escribir nada
 ```
 
+## Qué queda en el disco
+
+`wiki/` son las páginas y nada más.
+Cada `.md` empieza con su identidad, y con nada más: cualquier otro dato se queda viejo en
+cuanto alguien edita.
+
+```
+---
+outline_id: 3fc2b126-f371-45b9-a9ff-a4ae45a8328a
+---
+
+# Título de la página
+```
+
+El título es ese encabezado de nivel 1, así que no vive en dos sitios.
+
+Junto a `wiki/` está `.outline/`, el estado de la máquina.
+Se reconstruye entero con un `pull`, así que conviene añadirlo al `.gitignore` del proyecto:
+
+- `manifest.json`, con la ruta, la revisión del último `pull` y la colección de cada página,
+  más una marca de `pull` completo que solo se pone si la pasada terminó sin errores.
+- `base/`, la copia en la sombra: lo que Outline dio en el último `pull`, con la misma
+  estructura de carpetas y sin frontmatter, para comparar cuerpo contra cuerpo.
+- `index.md`, el árbol completo en el orden real de la barra lateral de Outline, que el árbol
+  de directorios no guarda.
+
 ## Tests
 
 ```
