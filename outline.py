@@ -781,6 +781,8 @@ TALLIES = [
     Tally("uploaded", "página subida", "páginas subidas", "subidas"),
     Tally("created", "creada", "creadas", "creadas"),
     Tally("moved", "movida", "movidas", "movidas"),
+    Tally("reformatted", "reformateada por Outline", "reformateadas por Outline",
+          "reformateadas por Outline al guardarlas, así que su fichero local ha cambiado"),
     Tally("overtaken", "movida con la remota adelantada", "movidas con la remota adelantada",
           "movidas, pero Outline tiene texto que no has visto. Pásales un 'outline pull'"),
     Tally("deleted", "borrada", "borradas", "borradas, a la papelera de Outline"),
@@ -813,6 +815,7 @@ class Pusher:
     uploaded: list = field(default_factory=list)
     created: list = field(default_factory=list)
     moved: list = field(default_factory=list)
+    reformatted: list = field(default_factory=list)
     overtaken: list = field(default_factory=list)
     deleted: list = field(default_factory=list)
     settled: list = field(default_factory=list)
@@ -867,6 +870,7 @@ class Pusher:
             self.unsure.append(f"wiki/{relative}, sin respuesta de Outline al escribirla")
             return False
         remember(self.root, self.manifest, was_at, document, collection)
+        self.settle_body(relative, document)
         self.uploaded.append(f"wiki/{relative}")
         return True
 
@@ -900,12 +904,9 @@ class Pusher:
         if document is None:
             self.rejected.append(f"wiki/{relative}, sin respuesta de Outline al crearla")
             return
-        document = self.place_last(document, relative, collection, parent)
+        document["revision"] = self.place_last(document, relative, collection, parent)
         self.pages_by_path[relative] = document["id"]
-        write(
-            self.root / "wiki" / relative,
-            frontmatter(document["id"]) + self.mirror.bodies[relative],
-        )
+        self.settle_body(relative, document)
         remember(self.root, self.manifest, relative, document, collection)
         self.created.append(f"wiki/{relative}")
 
@@ -922,7 +923,19 @@ class Pusher:
         moved = next(
             (d for d in answer.get("documents", []) if d["id"] == document["id"]), None
         )
-        return moved or document
+        return (moved or document).get("revision")
+
+    def settle_body(self, relative, document):
+        """Deja el fichero local con el texto que Outline ha guardado, que puede no ser el mío.
+
+        Outline reescribe el Markdown a su forma canónica al guardarlo, y sin esto el fichero
+        no vuelve a coincidir con su base nunca más.
+        """
+        body = page_body(document["title"], document.get("text"))
+        if self.mirror.bodies[relative] != body:
+            self.mirror.bodies[relative] = body
+            self.reformatted.append(f"wiki/{relative}")
+        write(self.root / "wiki" / relative, frontmatter(document["id"]) + body)
 
     def nesting(self, relative):
         """Dónde cuelga un fichero en Outline según su ruta: colección, ruta madre y su id."""

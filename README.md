@@ -70,7 +70,7 @@ De compararlas salen cuatro estados.
 |---|---|---|---|---|
 | igual | igual | limpia | nada | nada |
 | igual | cambió | remota adelantada | actualiza local y base | nada |
-| cambió | igual | sucia | no la toca | sube y adelanta la base |
+| cambió | igual | sucia | no la toca | sube y adelanta la base y el fichero |
 | cambió | cambió | conflicto | no la toca | se niega |
 
 Escribir es editar el Markdown y hacer `push`.
@@ -81,6 +81,14 @@ Se acepta la ventana de milisegundos entre comprobar y escribir, porque enfrente
 escribiendo a ritmo humano y Outline guarda el historial de revisiones de cada página.
 Si el último `pull` no llegó a terminar, el `push` avisa antes de nada, porque entonces la base
 puede estar a medias.
+
+Outline no guarda el Markdown tal y como se lo mandas: junta los saltos de línea sueltos dentro
+de un párrafo y normaliza el separador de las tablas.
+Por eso el `push` deja el fichero local con el texto que Outline devuelve, y lista las páginas
+que te ha reformateado.
+Si no lo hiciera, esas páginas no volverían a coincidir con su base: saldrían sucias en todos
+los `status`, se resubirían en todos los `push` y el `pull` nunca te traería lo que un socio
+escriba en ellas.
 
 Una página nueva es un `.md` nuevo en la carpeta que le toca.
 Sin `outline_id`, el `push` deduce la colección y la página padre de su ruta en el disco, la
