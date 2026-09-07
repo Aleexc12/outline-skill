@@ -6,18 +6,20 @@ description: Leer y escribir en la wiki de Outline del equipo. Usar siempre que 
 # Wiki del equipo en Outline
 
 La wiki vive en la instancia que apunte `OUTLINE_URL` y es la única fuente de verdad.
-La carpeta `wiki/` del proyecto es una copia autogenerada de solo lectura, y no se actualiza sola:
-solo cambia cuando se ejecuta `outline pull`.
+La carpeta `wiki/` del proyecto es una copia local que no se actualiza sola: solo cambia
+cuando se ejecuta `outline pull`.
 
 Los comandos se ejecutan desde la raíz del proyecto.
 
 ## Reglas
 
-1. **`wiki/` no se edita nunca a mano.**
-   Cada `pull` borra y regenera la carpeta entera.
+1. **Editar `wiki/` a mano no publica nada todavía.**
+   El `pull` ya no borra la carpeta, así que un cambio local sobrevive.
+   Pero `push` aún no existe: para que ese cambio llegue a Outline hay que escribirlo por API,
+   y mientras tanto el `pull` se salta esa página y su copia se queda vieja.
 2. **Leer siempre en local, escribir siempre por API.**
    Un documento por `documents.info` cuesta de 4 a 6 veces más contexto que su `.md`.
-3. **Antes de escribir: `check` de esa página, y `pull` si está desactualizada.**
+3. **Antes de escribir: `status`, o `check` de esa página, y `pull` si está desactualizada.**
    Sin la copia fresca, el `findText` de un `patch` no coincide con el texto real.
    Para una página nueva no hay nada que comprobar, así que ahí se baja directamente:
    hace falta para ver el árbol actual, elegir dónde colocarla y no duplicar algo que ya existe.
@@ -51,16 +53,36 @@ Cada `.md` empieza con su `outline_id` en el frontmatter, que es el id que piden
 Junto a `wiki/` queda `.outline/`, que es estado de la máquina y no se edita a mano: el
 manifiesto con la revisión de cada página, la copia en la sombra del último `pull` en `base/`
 y ese índice.
-Se regenera entero con el `pull` siguiente.
+El `pull` lo actualiza a la vez que las páginas.
 
-## Escribir
+## Saber en qué estado estás
 
-Comprobar primero que la copia local de esa página está al día.
-Acepta id, ruta o un trozo del título, y sale con código 1 si hay que sincronizar.
+Cada página tiene tres versiones: la local, en `wiki/`; la base, en `.outline/base/`, que es lo
+que Outline dio en el último `pull`; y la remota.
+De compararlas salen cuatro estados.
+
+```bash
+outline status        # la colección del proyecto
+outline status --all  # todas
+```
+
+| local vs base | remoto vs base | Estado | Qué hace el `pull` |
+|---|---|---|---|
+| igual | igual | limpia | nada |
+| igual | cambió | remota adelantada | actualiza local y base |
+| cambió | igual | sucia | no la toca |
+| cambió | cambió | conflicto | no la toca |
+
+`status` lista las que no están limpias, y aparte los ficheros que aún no existen en Outline.
+Para una página suelta, `check` compara su revisión con la del remoto y sale con código 1 si
+hay que sincronizar.
+Acepta id, ruta o un trozo del título.
 
 ```bash
 outline check "nombre de la pagina"
 ```
+
+## Escribir
 
 El token y la dirección viven en las variables de entorno de usuario, así que ya están puestos:
 
@@ -74,7 +96,7 @@ Dónde colocarla se decide leyendo `.outline/index.md`, que trae el árbol enter
 y jerarquía: basta para elegir colección y página padre sin preguntar.
 Lo normal es colgarla de la página con la que comparte tema, y dejarla en la raíz de la
 colección solo cuando abre un tema nuevo.
-Que `wiki/` sea de solo lectura no estorba: se decide leyendo el espejo local y se escribe
+Crear el `.md` en local no crea la página: se decide leyendo el espejo local y se escribe
 en Outline, que es lo que el siguiente `pull` refleja.
 
 Sin `publish` la página queda como borrador y no la ve nadie.

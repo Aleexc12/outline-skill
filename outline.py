@@ -8,17 +8,18 @@ import argparse
 import json
 import os
 import re
-import shutil
 import ssl
 import sys
 import unicodedata
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 PAGE_SIZE = 100
 STATE_DIR = ".outline"
 FRONTMATTER = re.compile(r"\A---\n.*?\n---\n+", re.DOTALL)
+IDENTITY = re.compile(r"\A---\s*\noutline_id:\s*(\S+)\s*\n---")
 
 WINDOWS_RESERVED = {
     "con", "prn", "aux", "nul",
@@ -139,7 +140,7 @@ def slugify(text, fallback="sin-titulo"):
     return slug
 
 
-def scope(collections, root, todas):
+def matching_collections(collections, root, todas):
     """Las colecciones a bajar, y si sus rutas llevan el nombre de la colección delante.
 
     Sin --all, el ámbito sale de comparar el nombre del directorio del proyecto con el de
@@ -163,6 +164,33 @@ def scope(collections, root, todas):
 def write(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def discard(path, stop):
+    """Borra un fichero y, por encima, las carpetas que se queden vacías."""
+    if not path.is_file():
+        return
+    path.unlink()
+    for parent in path.parents:
+        if parent == stop or any(parent.iterdir()):
+            return
+        try:
+            parent.rmdir()
+        except OSError:
+            return
+
+
+def plural(count, one, many):
+    return f"{count} {one if count == 1 else many}"
+
+
+def section(title, pages):
+    if not pages:
+        return
+    print(f"{title} ({len(pages)}):")
+    for page in pages:
+        print(f"  {page}")
+    print()
 
 
 def frontmatter(document_id):
@@ -199,80 +227,243 @@ def write_manifest(root, documents, complete):
     )
 
 
-def pull(client, root, todas):
-    wiki = root / "wiki"
-    base = root / STATE_DIR / "base"
+@dataclass
+class Page:
+    """Una página del remoto con la ruta que le toca en el disco."""
 
-    collections = list(client.paginate("collections.list", {}))
-    selected, prefixed = scope(collections, root, todas)
+    id: str
+    title: str
+    body: str
+    revision: int
+    path: str
+    collection: dict
+    depth: int
 
+
+def remote_documents(client, selected):
     documents = {}
     for collection in selected:
         for item in client.paginate(
             "documents.list", {"collectionId": collection["id"], "statusFilter": ["published"]}
         ):
             documents[item["id"]] = item
+    return documents
 
-    write_manifest(root, read_manifest(root).get("documents", {}), complete=False)
 
-    for directory in (wiki, base):
-        if directory.exists():
-            shutil.rmtree(directory)
-        directory.mkdir(parents=True)
+@dataclass
+class Scope:
+    """Las colecciones que le tocan a este proyecto, con sus documentos remotos."""
 
-    manifest = {}
-    index_lines = []
-    missing = []
+    collections: list
+    prefixed: bool
+    documents: dict
 
-    def walk(nodes, relative_dir, collection_name, depth):
+    @classmethod
+    def read(cls, client, root, todas):
+        available = list(client.paginate("collections.list", {}))
+        selected, prefixed = matching_collections(available, root, todas)
+        return cls(selected, prefixed, remote_documents(client, selected))
+
+    @property
+    def ids(self):
+        return {collection["id"] for collection in self.collections}
+
+    def label(self):
+        if self.prefixed:
+            return "todas las colecciones"
+        return f"la colección {self.collections[0]['name']}"
+
+
+def remote_pages(client, scope):
+    """Las páginas del ámbito, en el orden de la barra lateral, con su ruta en el disco.
+
+    Devuelve además los nodos cuyo contenido no se pudo leer, que no son páginas
+    borradas y hay que proteger de la limpieza.
+    """
+    pages, missing, taken = [], [], set()
+
+    def walk(nodes, relative_dir, collection, depth):
         for node in nodes:
-            document = documents.get(node["id"])
+            document = scope.documents.get(node["id"])
             if document is None:
                 document = (client.post("documents.info", {"id": node["id"]}) or {}).get("data")
             if document is None:
-                missing.append(node["title"])
+                missing.append(node)
                 continue
 
             stem = slugify(node["title"])
-            if (wiki / relative_dir / f"{stem}.md").exists():
+            if (relative_dir / f"{stem}.md").as_posix() in taken:
                 stem = f"{stem}-{document.get('urlId') or document['id'][:8]}"
             relative = (relative_dir / f"{stem}.md").as_posix()
+            taken.add(relative)
 
             title = document.get("title") or node["title"]
-            body = page_body(title, document.get("text"))
-            write(wiki / relative, frontmatter(document["id"]) + body)
-            write(base / relative, body)
+            pages.append(
+                Page(
+                    id=document["id"],
+                    title=title,
+                    body=page_body(title, document.get("text")),
+                    revision=document.get("revision"),
+                    path=relative,
+                    collection=collection,
+                    depth=depth,
+                )
+            )
+            walk(node.get("children") or [], relative_dir / stem, collection, depth + 1)
 
-            manifest[document["id"]] = {
-                "path": relative,
-                "revision": document.get("revision"),
-                "collection": collection_name,
-            }
-            index_lines.append(f"{'  ' * depth}- [{title}](../wiki/{relative}) `{document['id']}`")
-
-            if node.get("children"):
-                walk(node["children"], relative_dir / stem, collection_name, depth + 1)
-
-    for collection in selected:
-        name = collection["name"]
+    for collection in scope.collections:
         tree = client.post("collections.documents", {"id": collection["id"]}).get("data") or []
-        index_lines.append(f"\n## {name}\n")
-        walk(tree, Path(slugify(name)) if prefixed else Path(), name, 0)
+        root = Path(slugify(collection["name"])) if scope.prefixed else Path()
+        walk(tree, root, collection, 0)
+    return pages, missing
 
+
+def pages_on_disk(directory):
+    return sorted(directory.rglob("*.md")) if directory.is_dir() else []
+
+
+def shadow(directory):
+    """Los cuerpos de `.outline/base/`, indexados por su ruta."""
+    return {
+        path.relative_to(directory).as_posix(): path.read_text(encoding="utf-8")
+        for path in pages_on_disk(directory)
+    }
+
+
+@dataclass
+class Mirror:
+    """La copia local de `wiki/`, leída entera antes de escribir nada encima."""
+
+    bodies: dict
+    ids: dict
+
+    @classmethod
+    def read(cls, wiki):
+        bodies, ids = {}, {}
+        for path in pages_on_disk(wiki):
+            relative = path.relative_to(wiki).as_posix()
+            text = path.read_text(encoding="utf-8", errors="replace")
+            match = IDENTITY.match(text)
+            if match:
+                ids[relative] = match.group(1)
+            bodies[relative] = strip_frontmatter(text)
+        return cls(bodies, ids)
+
+
+def changed(local, base, remote):
+    """Si la copia local tiene algo que no está ni en la base ni en el remoto."""
+    return local != base and local != remote
+
+
+def advanced(page, entry, base):
+    """Si Outline se movió respecto de la base que dejó el último pull."""
+    if page is None:
+        return True
+    if base is None:
+        return False
+    return page.body != base or page.path != entry["path"]
+
+
+def write_index(root, entries):
+    lines, previous = [], None
+    for collection, depth, title, relative, document_id in entries:
+        if collection != previous:
+            lines.append(f"\n## {collection}\n")
+            previous = collection
+        lines.append(f"{'  ' * depth}- [{title}](../wiki/{relative}) `{document_id}`")
     write(
         root / STATE_DIR / "index.md",
         "# Índice de la wiki\n\n"
         "El árbol completo en el orden real de la barra lateral de Outline, que el árbol de\n"
         "directorios no guarda. Lo genera `outline pull`; editarlo a mano no cambia nada.\n"
-        + "\n".join(index_lines)
+        + "\n".join(lines)
         + "\n",
     )
+
+
+def pull(client, root, todas):
+    wiki = root / "wiki"
+    shadow_dir = root / STATE_DIR / "base"
+
+    scope = Scope.read(client, root, todas)
+    previous = read_manifest(root).get("documents", {})
+    write_manifest(root, previous, complete=False)
+
+    pages, missing = remote_pages(client, scope)
+    untouched = {node["id"] for node in missing}
+    manifest = {
+        i: e
+        for i, e in previous.items()
+        if e.get("collectionId") not in scope.ids or i in untouched
+    }
+
+    mirror = Mirror.read(wiki)
+    shadowed = shadow(shadow_dir)
+    destinations = {page.path for page in pages}
+
+    def release(directory, relative):
+        """Deja libre la ruta vieja de una página que se movió, si nadie más la ocupa."""
+        if relative not in destinations:
+            discard(directory / relative, directory)
+
+    skipped, updated, removed, entries = [], 0, 0, []
+
+    for page in pages:
+        entry = previous.get(page.id)
+        was_at = entry["path"] if entry else page.path
+        local = mirror.bodies.get(was_at)
+
+        if changed(local, shadowed.get(was_at), page.body):
+            skipped.append(f"wiki/{was_at}")
+            if entry:
+                manifest[page.id] = entry
+            lives_at = was_at
+        else:
+            lives_at = page.path
+            if local != page.body or was_at != lives_at:
+                updated += 1
+            write(wiki / lives_at, frontmatter(page.id) + page.body)
+            write(shadow_dir / lives_at, page.body)
+            if was_at != lives_at:
+                release(wiki, was_at)
+                release(shadow_dir, was_at)
+            manifest[page.id] = {
+                "path": lives_at,
+                "revision": page.revision,
+                "collection": page.collection["name"],
+                "collectionId": page.collection["id"],
+            }
+        entries.append((page.collection["name"], page.depth, page.title, lives_at, page.id))
+
+    seen = {page.id for page in pages} | untouched
+    for document_id, entry in previous.items():
+        if document_id in seen or entry.get("collectionId") not in scope.ids:
+            continue
+        if changed(mirror.bodies.get(entry["path"]), shadowed.get(entry["path"]), None):
+            skipped.append(f"wiki/{entry['path']} (borrada en Outline)")
+            manifest[document_id] = entry
+        else:
+            release(wiki, entry["path"])
+            release(shadow_dir, entry["path"])
+            removed += 1
+
+    write_index(root, entries)
     write_manifest(root, manifest, complete=not missing)
 
-    ambito = "todas las colecciones" if prefixed else f"la colección {selected[0]['name']}"
-    print(f"bajados {len(manifest)} documentos de {ambito} -> {wiki}")
+    partes = [f"{plural(len(pages), 'página', 'páginas')} en {scope.label()}"]
+    if updated:
+        partes.append(plural(updated, "actualizada", "actualizadas"))
+    if removed:
+        partes.append(plural(removed, "borrada aquí", "borradas aquí"))
+    if skipped:
+        partes.append(f"{len(skipped)} sin tocar")
+    if not updated and not removed and not skipped:
+        partes.append("todo al día")
+    print(f"{', '.join(partes)} -> {wiki}")
+    section("sin tocar por tener cambios locales", skipped)
     if missing:
-        print(f"aviso: sin contenido accesible para {len(missing)}: {', '.join(missing)}")
+        titles = ", ".join(node["title"] for node in missing)
+        print(f"aviso: sin contenido accesible para {len(missing)}: {titles}")
     return 0
 
 
@@ -316,6 +507,79 @@ def resolve(root, manifest, needle):
     return matches[0]
 
 
+def status(client, root, todas):
+    wiki = root / "wiki"
+
+    manifest = load_manifest(root)
+    scope = Scope.read(client, root, todas)
+    pages, missing = remote_pages(client, scope)
+    mirror = Mirror.read(wiki)
+    shadowed = shadow(root / STATE_DIR / "base")
+
+    remote = {page.id: page for page in pages}
+    unreadable = {node["id"] for node in missing}
+    tracked = {entry["path"] for entry in manifest.values()}
+    located = {document_id: relative for relative, document_id in mirror.ids.items()}
+
+    limpias, sucias, adelantadas, conflictos = 0, [], [], []
+    for document_id, entry in manifest.items():
+        if entry.get("collectionId") not in scope.ids or document_id in unreadable:
+            continue
+        page = remote.get(document_id)
+        base = shadowed.get(entry["path"])
+        moved_to = located.get(document_id)
+        moved = moved_to is not None and moved_to != entry["path"]
+        if moved:
+            tracked.add(moved_to)
+        local = mirror.bodies.get(moved_to if moved else entry["path"])
+
+        mine = moved or changed(local, base, page.body if page else None)
+        theirs = advanced(page, entry, base)
+
+        etiqueta = f"wiki/{moved_to} (movida desde {entry['path']})" if moved else f"wiki/{entry['path']}"
+        if page is None:
+            etiqueta += " (borrada en Outline)"
+        elif local is None:
+            etiqueta += " (borrada aquí)"
+
+        if mine and theirs:
+            conflictos.append(etiqueta)
+        elif mine:
+            sucias.append(etiqueta)
+        elif theirs:
+            adelantadas.append(etiqueta)
+        else:
+            limpias += 1
+
+    # Un fichero fuera del manifiesto es una página nueva o una que el pull nunca llegó a adoptar.
+    nuevas = []
+    for relative, body in mirror.bodies.items():
+        if relative in tracked:
+            continue
+        page = remote.get(mirror.ids.get(relative))
+        if page is None:
+            nuevas.append(f"wiki/{relative}")
+        elif body != page.body:
+            sucias.append(f"wiki/{relative}")
+        else:
+            limpias += 1
+
+    section("sucias, cambiadas aquí desde el último pull", sorted(sucias))
+    section("remota adelantada, cambiadas en Outline", sorted(adelantadas))
+    section("en conflicto, cambiadas aquí y en Outline", sorted(conflictos))
+    section("nuevas, todavía no están en Outline", sorted(nuevas))
+
+    print(
+        f"{plural(limpias, 'limpia', 'limpias')}, {plural(len(sucias), 'sucia', 'sucias')}, "
+        f"{len(adelantadas)} con la remota adelantada y {len(conflictos)} en conflicto "
+        f"en {scope.label()}"
+    )
+    if missing:
+        titles = ", ".join(node["title"] for node in missing)
+        print(f"aviso: sin contenido accesible para {len(missing)}: {titles}")
+    return 0
+
+
 def check(client, root, needles):
     manifest = load_manifest(root)
     targets = (
@@ -343,8 +607,9 @@ def main(argv=None):
         prog="outline", description="Espejo local de una wiki de Outline"
     )
     parser.add_argument(
-        "command", nargs="?", default="pull", choices=["pull", "check"],
-        help="pull baja la wiki, check compara revisiones sin escribir nada",
+        "command", nargs="?", default="pull", choices=["pull", "status", "check"],
+        help="pull baja la wiki, status dice en qué estado estás, "
+             "check compara revisiones sin escribir nada",
     )
     parser.add_argument(
         "targets", nargs="*",
@@ -352,7 +617,7 @@ def main(argv=None):
     )
     parser.add_argument(
         "--all", dest="todas", action="store_true",
-        help="baja todas las colecciones en vez de la que se llama como el proyecto",
+        help="trabaja con todas las colecciones en vez de la que se llama como el proyecto",
     )
     parser.add_argument("--url", help="dirección de la instancia. Por defecto, OUTLINE_URL")
     arguments = parser.parse_args(argv)
@@ -361,6 +626,8 @@ def main(argv=None):
     root = project_root()
     if arguments.command == "check":
         return check(client, root, arguments.targets)
+    if arguments.command == "status":
+        return status(client, root, arguments.todas)
     return pull(client, root, arguments.todas)
 
 

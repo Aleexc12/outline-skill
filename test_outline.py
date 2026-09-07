@@ -41,6 +41,7 @@ class Transporte:
         self.documentos = {}
         self.arboles = {}
         self.romper = None
+        self.inaccesibles = set()
         for indice, (nombre, nodos) in enumerate(arbol.items(), start=1):
             coleccion = f"col-{indice}"
             self.colecciones.append({"id": coleccion, "name": nombre})
@@ -78,13 +79,36 @@ class Transporte:
         if endpoint == "documents.list":
             coleccion = payload.get("collectionId")
             return self._pagina(
-                [d for d in self.documentos.values() if d["collectionId"] == coleccion]
+                [
+                    d for d in self.documentos.values()
+                    if d["collectionId"] == coleccion and d["id"] not in self.inaccesibles
+                ]
             )
         if endpoint == "collections.documents":
             return {"data": self.arboles[payload["id"]]}
         if endpoint == "documents.info":
+            if payload["id"] in self.inaccesibles:
+                return {"data": None}
             return {"data": self.documentos[payload["id"]]}
         raise AssertionError(f"endpoint no guionizado: {endpoint}")
+
+    def editar(self, documento_id, texto):
+        """Un socio edita esa página en Outline, lo que adelanta su revisión."""
+        documento = self.documentos[documento_id]
+        documento["text"] = texto
+        documento["revision"] += 1
+
+    def borrar(self, documento_id):
+        del self.documentos[documento_id]
+        for coleccion, arbol in self.arboles.items():
+            self.arboles[coleccion] = self._podar(arbol, documento_id)
+
+    def _podar(self, nodos, documento_id):
+        return [
+            {**nodo, "children": self._podar(nodo["children"], documento_id)}
+            for nodo in nodos
+            if nodo["id"] != documento_id
+        ]
 
     def colecciones_pedidas(self):
         return [p["collectionId"] for e, p in self.peticiones if e == "documents.list"]
@@ -123,6 +147,12 @@ class Caso(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return outline.main(list(argv))
 
+    def salida(self, *argv):
+        escrito = io.StringIO()
+        with contextlib.redirect_stdout(escrito):
+            outline.main(list(argv))
+        return escrito.getvalue()
+
     def ejecutar_fallando(self, *argv):
         error = io.StringIO()
         with contextlib.redirect_stderr(error), contextlib.redirect_stdout(io.StringIO()):
@@ -137,6 +167,19 @@ class Caso(unittest.TestCase):
     def identificador(self, raiz, ruta):
         documentos = self.estado(raiz)["documents"]
         return next(i for i, entrada in documentos.items() if entrada["path"] == ruta)
+
+    def pagina(self, raiz, ruta):
+        return (raiz / "wiki" / ruta).read_text(encoding="utf-8")
+
+    def base(self, raiz, ruta):
+        return (raiz / ".outline" / "base" / ruta).read_text(encoding="utf-8")
+
+    def editar_local(self, raiz, ruta, linea):
+        """Edita la página como lo haría la persona. Devuelve el texto que queda en el disco."""
+        pagina = raiz / "wiki" / ruta
+        texto = pagina.read_text(encoding="utf-8").rstrip("\n") + f"\n\n{linea}\n"
+        pagina.write_text(texto, encoding="utf-8")
+        return texto
 
 
 class Ambito(Caso):
@@ -262,8 +305,19 @@ class Manifiesto(Caso):
                 "path": "diagnostico/auditoria-de-ruido.md",
                 "revision": 1,
                 "collection": "Taller",
+                "collectionId": "col-1",
             },
         )
+
+    def test_la_coleccion_se_sigue_por_su_id_y_no_por_su_nombre(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        self.transporte.colecciones[0]["name"] = "Taller mecánico"
+
+        self.ejecutar("pull", "--all")
+
+        self.assertFalse((raiz / "wiki" / "diagnostico.md").exists())
+        self.assertTrue((raiz / "wiki" / "taller-mecanico" / "diagnostico.md").is_file())
 
     def test_un_pull_que_termina_deja_la_marca_de_completo(self):
         raiz = self.proyecto("Taller")
@@ -370,6 +424,320 @@ class Check(Caso):
         self.proyecto("Taller")
 
         self.assertIn("outline pull", self.ejecutar_fallando("check"))
+
+
+class TresVersiones(Caso):
+    """Las cuatro combinaciones de la tabla: local contra base, y remoto contra base."""
+
+    def preparar(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        return raiz
+
+    def test_limpia_el_pull_la_deja_como_estaba(self):
+        raiz = self.preparar()
+        antes = self.pagina(raiz, "diagnostico.md")
+
+        self.ejecutar("pull")
+
+        self.assertEqual(self.pagina(raiz, "diagnostico.md"), antes)
+        self.assertEqual(self.base(raiz, "diagnostico.md"), "# Diagnóstico\n\nCuerpo del diagnóstico.\n")
+
+    def test_remota_adelantada_se_actualiza_en_local_y_en_la_base(self):
+        raiz = self.preparar()
+        identificador = self.identificador(raiz, "diagnostico.md")
+        self.transporte.editar(identificador, "Lo que escribió mi socio.")
+
+        self.ejecutar("pull")
+
+        self.assertIn("Lo que escribió mi socio.", self.pagina(raiz, "diagnostico.md"))
+        self.assertIn("Lo que escribió mi socio.", self.base(raiz, "diagnostico.md"))
+        self.assertEqual(self.estado(raiz)["documents"][identificador]["revision"], 2)
+
+    def test_sucia_el_pull_no_la_toca(self):
+        raiz = self.preparar()
+        mio = self.editar_local(raiz, "diagnostico.md", "Lo que escribí yo.")
+
+        self.ejecutar("pull")
+
+        self.assertEqual(self.pagina(raiz, "diagnostico.md"), mio)
+        self.assertNotIn("Lo que escribí yo.", self.base(raiz, "diagnostico.md"))
+
+    def test_en_conflicto_el_pull_no_la_toca_y_la_base_no_avanza(self):
+        raiz = self.preparar()
+        identificador = self.identificador(raiz, "diagnostico.md")
+        mio = self.editar_local(raiz, "diagnostico.md", "Lo que escribí yo.")
+        self.transporte.editar(identificador, "Lo que escribió mi socio.")
+
+        self.ejecutar("pull")
+
+        self.assertEqual(self.pagina(raiz, "diagnostico.md"), mio)
+        self.assertNotIn("mi socio", self.base(raiz, "diagnostico.md"))
+        self.assertEqual(self.estado(raiz)["documents"][identificador]["revision"], 1)
+
+    def test_una_pagina_sucia_no_estorba_a_las_demas(self):
+        raiz = self.preparar()
+        self.editar_local(raiz, "diagnostico.md", "Lo que escribí yo.")
+        self.transporte.editar(self.identificador(raiz, "albaran.md"), "Albarán al día.")
+
+        self.ejecutar("pull")
+
+        self.assertIn("Albarán al día.", self.pagina(raiz, "albaran.md"))
+
+
+class PullNoDestructivo(Caso):
+    def test_no_borra_la_carpeta_wiki(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        mias = raiz / "wiki" / "mis-notas.md"
+        mias.write_text("# Mis notas\n\nTodavía sin subir.\n", encoding="utf-8")
+
+        self.ejecutar("pull")
+
+        self.assertEqual(mias.read_text(encoding="utf-8"), "# Mis notas\n\nTodavía sin subir.\n")
+
+    def test_un_pull_interrumpido_conserva_las_paginas_ya_bajadas(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        self.transporte.romper = "collections.documents"
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(ConnectionError):
+                outline.main(["pull"])
+
+        self.assertTrue((raiz / "wiki" / "diagnostico.md").is_file())
+        self.assertFalse(self.estado(raiz)["pullComplete"])
+
+    def test_una_pagina_sin_contenido_accesible_ni_se_borra_ni_deja_la_marca(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        identificador = self.identificador(raiz, "albaran.md")
+        self.transporte.inaccesibles.add(identificador)
+
+        salida = self.salida("pull")
+
+        self.assertTrue((raiz / "wiki" / "albaran.md").is_file())
+        self.assertIn(identificador, self.estado(raiz)["documents"])
+        self.assertFalse(self.estado(raiz)["pullComplete"])
+        self.assertIn("sin contenido accesible", salida)
+
+    def test_funciona_con_un_proceso_dentro_de_wiki(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        self.transporte.editar(self.identificador(raiz, "diagnostico.md"), "Cuerpo nuevo.")
+        os.chdir(raiz / "wiki" / "diagnostico")
+
+        self.ejecutar("pull")
+
+        self.assertIn("Cuerpo nuevo.", self.pagina(raiz, "diagnostico.md"))
+
+    def test_una_pagina_que_muevo_de_carpeta_no_vuelve_a_su_sitio(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        destino = raiz / "wiki" / "diagnostico" / "albaran.md"
+        (raiz / "wiki" / "albaran.md").rename(destino)
+
+        salida = self.salida("pull")
+
+        self.assertTrue(destino.is_file())
+        self.assertFalse((raiz / "wiki" / "albaran.md").exists())
+        self.assertIn("sin tocar por tener cambios locales (1)", salida)
+
+    def test_una_base_a_medio_escribir_se_cura_en_la_pasada_siguiente(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        (raiz / ".outline" / "base" / "albaran.md").write_text("a medias\n", encoding="utf-8")
+
+        salida = self.salida("pull")
+
+        self.assertEqual(self.base(raiz, "albaran.md"), "# Albarán\n\nCuerpo del albarán.\n")
+        self.assertNotIn("sin tocar", salida)
+
+    def test_lista_cuantas_paginas_se_salto_y_cuales(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        self.editar_local(raiz, "diagnostico.md", "Lo que escribí yo.")
+
+        salida = self.salida("pull")
+
+        self.assertIn("sin tocar por tener cambios locales (1)", salida)
+        self.assertIn("wiki/diagnostico.md", salida)
+
+    def test_una_pagina_renombrada_en_outline_se_mueve_en_local(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        identificador = self.identificador(raiz, "albaran.md")
+        self.transporte.documentos[identificador]["title"] = "Albarán de entrega"
+        self.transporte.arboles["col-1"][1]["title"] = "Albarán de entrega"
+
+        self.ejecutar("pull")
+
+        self.assertTrue((raiz / "wiki" / "albaran-de-entrega.md").is_file())
+        self.assertFalse((raiz / "wiki" / "albaran.md").exists())
+        self.assertFalse((raiz / ".outline" / "base" / "albaran.md").exists())
+
+
+    def test_dos_paginas_que_se_intercambian_el_titulo_no_se_pisan(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        uno, dos = self.identificador(raiz, "diagnostico.md"), self.identificador(raiz, "albaran.md")
+        for documento, titulo in ((uno, "Albarán"), (dos, "Diagnóstico")):
+            self.transporte.documentos[documento]["title"] = titulo
+        for nodo, titulo in zip(self.transporte.arboles["col-1"], ("Albarán", "Diagnóstico")):
+            nodo["title"] = titulo
+
+        self.ejecutar("pull")
+
+        self.assertIn("Cuerpo del diagnóstico.", self.pagina(raiz, "albaran.md"))
+        self.assertIn("Cuerpo del albarán.", self.pagina(raiz, "diagnostico.md"))
+        self.assertEqual(self.identificador(raiz, "albaran.md"), uno)
+        self.assertEqual(self.identificador(raiz, "diagnostico.md"), dos)
+
+
+class PullBorrados(Caso):
+    def test_una_pagina_limpia_borrada_en_outline_se_borra_en_local(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        identificador = self.identificador(raiz, "albaran.md")
+        self.transporte.borrar(identificador)
+
+        self.ejecutar("pull")
+
+        self.assertFalse((raiz / "wiki" / "albaran.md").exists())
+        self.assertFalse((raiz / ".outline" / "base" / "albaran.md").exists())
+        self.assertNotIn(identificador, self.estado(raiz)["documents"])
+
+    def test_una_pagina_sucia_borrada_en_outline_se_queda(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        identificador = self.identificador(raiz, "albaran.md")
+        mio = self.editar_local(raiz, "albaran.md", "Lo que escribí yo.")
+        self.transporte.borrar(identificador)
+
+        salida = self.salida("pull")
+
+        self.assertEqual(self.pagina(raiz, "albaran.md"), mio)
+        self.assertIn(identificador, self.estado(raiz)["documents"])
+        self.assertIn("borrada en Outline", salida)
+
+    def test_una_coleccion_fuera_de_ambito_no_se_borra(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull", "--all")
+
+        self.ejecutar("pull")
+
+        self.assertTrue((raiz / "wiki" / "almacen-nuble" / "inventario.md").is_file())
+        self.assertTrue((raiz / "wiki" / "diagnostico.md").is_file())
+        self.assertFalse((raiz / "wiki" / "taller" / "diagnostico.md").exists())
+
+
+class Status(Caso):
+    def secciones(self, salida):
+        """La salida agrupada: cada encabezado con las páginas que lista debajo."""
+        grupos, actual = {}, None
+        for linea in salida.splitlines():
+            if not linea.strip():
+                continue
+            if linea.startswith("  ") and actual:
+                grupos[actual].append(linea.strip())
+            elif linea.endswith("):"):
+                actual = linea
+                grupos[actual] = []
+            else:
+                actual = None
+        return grupos
+
+    def seccion(self, salida, prefijo):
+        for encabezado, paginas in self.secciones(salida).items():
+            if encabezado.startswith(prefijo):
+                return paginas
+        self.fail(f"no hay ninguna sección '{prefijo}' en:\n{salida}")
+
+    def test_distingue_los_cuatro_estados(self):
+        raiz = self.proyecto("Cualquiera")
+        self.ejecutar("pull", "--all")
+        self.editar_local(raiz, "taller/albaran.md", "Lo que escribí yo.")
+        self.transporte.editar(
+            self.identificador(raiz, "taller/diagnostico/auditoria-de-ruido.md"), "Ruido nuevo."
+        )
+        conflictiva = self.identificador(raiz, "taller/diagnostico.md")
+        self.editar_local(raiz, "taller/diagnostico.md", "Lo que escribí yo.")
+        self.transporte.editar(conflictiva, "Lo que escribió mi socio.")
+
+        salida = self.salida("status", "--all")
+
+        self.assertEqual(self.seccion(salida, "sucias"), ["wiki/taller/albaran.md"])
+        self.assertEqual(
+            self.seccion(salida, "remota adelantada"),
+            ["wiki/taller/diagnostico/auditoria-de-ruido.md"],
+        )
+        self.assertEqual(self.seccion(salida, "en conflicto"), ["wiki/taller/diagnostico.md"])
+        self.assertIn("1 limpia", salida)
+
+    def test_con_todo_al_dia_no_senala_ninguna_pagina(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+
+        salida = self.salida("status")
+
+        self.assertEqual(self.secciones(salida), {})
+        self.assertNotIn("\n  ", salida)
+        self.assertIn("3 limpias", salida)
+        self.assertEqual(self.ejecutar("status"), 0)
+
+    def test_una_pagina_borrada_en_local_sale_como_sucia(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        (raiz / "wiki" / "albaran.md").unlink()
+
+        salida = self.salida("status")
+
+        self.assertEqual(self.seccion(salida, "sucias"), ["wiki/albaran.md (borrada aquí)"])
+
+    def test_una_pagina_que_muevo_de_carpeta_sale_como_sucia_en_su_sitio_nuevo(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        (raiz / "wiki" / "albaran.md").rename(raiz / "wiki" / "diagnostico" / "albaran.md")
+
+        salida = self.salida("status")
+
+        self.assertEqual(
+            self.seccion(salida, "sucias"),
+            ["wiki/diagnostico/albaran.md (movida desde albaran.md)"],
+        )
+        self.assertNotIn("nuevas", salida)
+        self.assertIn("2 limpias", salida)
+
+    def test_un_fichero_nuevo_sale_como_pendiente_de_subir(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        (raiz / "wiki" / "mis-notas.md").write_text("# Mis notas\n", encoding="utf-8")
+
+        salida = self.salida("status")
+
+        self.assertEqual(self.seccion(salida, "nuevas"), ["wiki/mis-notas.md"])
+
+    def test_una_pagina_con_identidad_fuera_del_manifiesto_sale_como_sucia(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        identificador = self.identificador(raiz, "albaran.md")
+        pagina = self.pagina(raiz, "albaran.md")
+        # Como si el proyecto viniera recién clonado: la wiki está, el estado local no.
+        (raiz / ".outline" / "base" / "albaran.md").unlink()
+        estado = self.estado(raiz)
+        del estado["documents"][identificador]
+        (raiz / ".outline" / "manifest.json").write_text(json.dumps(estado), encoding="utf-8")
+        (raiz / "wiki" / "albaran.md").write_text(pagina + "\nLo que escribí yo.\n", encoding="utf-8")
+
+        salida = self.salida("status")
+
+        self.assertEqual(self.seccion(salida, "sucias"), ["wiki/albaran.md"])
+        self.assertNotIn("nuevas", salida)
+
+    def test_sin_manifiesto_pide_un_pull(self):
+        self.proyecto("Taller")
+
+        self.assertIn("outline pull", self.ejecutar_fallando("status"))
 
 
 class Configuracion(Caso):

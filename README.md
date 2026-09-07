@@ -47,8 +47,29 @@ sitio, apunta `OUTLINE_HOME` ahí.
 ```
 outline pull          # baja la colección que se llama como el proyecto
 outline pull --all    # baja todas las colecciones
-outline check "..."   # compara revisiones sin escribir nada
+outline status        # qué has tocado tú y qué se ha movido en Outline
+outline check "..."   # compara la revisión de una página con la del remoto
 ```
+
+El `pull` no borra la carpeta.
+Recorre las páginas una a una, actualiza las que no has tocado y deja intactas las que sí,
+listándolas al final.
+Una página que desapareció de Outline se borra en local solo si estaba limpia.
+
+Cada página tiene tres versiones: la local, en `wiki/`; la base, en `.outline/base/`, que es
+lo que Outline dio en el último `pull`; y la remota.
+De compararlas salen cuatro estados.
+
+| local vs base | remoto vs base | Estado | Qué hace el `pull` |
+|---|---|---|---|
+| igual | igual | limpia | nada |
+| igual | cambió | remota adelantada | actualiza local y base |
+| cambió | igual | sucia | no la toca |
+| cambió | cambió | conflicto | no la toca |
+
+Editar en local todavía no publica, porque `push` llega después.
+Mientras tanto, una página editada a mano se queda fuera de las actualizaciones hasta que su
+cambio llegue a Outline.
 
 ## Qué queda en el disco
 
@@ -67,7 +88,7 @@ outline_id: 3fc2b126-f371-45b9-a9ff-a4ae45a8328a
 El título es ese encabezado de nivel 1, así que no vive en dos sitios.
 
 Junto a `wiki/` está `.outline/`, el estado de la máquina.
-Se reconstruye entero con un `pull`, así que conviene añadirlo al `.gitignore` del proyecto:
+Se reconstruye con un `pull`, así que conviene añadirlo al `.gitignore` del proyecto:
 
 - `manifest.json`, con la ruta, la revisión del último `pull` y la colección de cada página,
   más una marca de `pull` completo que solo se pone si la pasada terminó sin errores.
