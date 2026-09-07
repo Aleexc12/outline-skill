@@ -181,6 +181,40 @@ class Caso(unittest.TestCase):
         pagina.write_text(texto, encoding="utf-8")
         return texto
 
+    def crear_local(self, raiz, ruta, texto):
+        """Un fichero que escribí yo y que Outline no conoce todavía."""
+        destino = raiz / "wiki" / ruta
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        destino.write_text(texto, encoding="utf-8")
+        return texto
+
+    def retitular(self, raiz, ruta, titulo):
+        """Renombra en Outline la página que hoy vive en esa ruta. Devuelve su identificador."""
+        identificador = self.identificador(raiz, ruta)
+        self.transporte.documentos[identificador]["title"] = titulo
+        for coleccion, arbol in self.transporte.arboles.items():
+            self.transporte.arboles[coleccion] = self._retitular(arbol, identificador, titulo)
+        return identificador
+
+    def _retitular(self, nodos, identificador, titulo):
+        return [
+            {
+                **nodo,
+                "title": titulo if nodo["id"] == identificador else nodo["title"],
+                "children": self._retitular(nodo["children"], identificador, titulo),
+            }
+            for nodo in nodos
+        ]
+
+    def degradar_manifiesto(self, raiz):
+        """El manifiesto como lo escribía la versión anterior, sin el id de la colección."""
+        estado = self.estado(raiz)
+        for entrada in estado["documents"].values():
+            entrada.pop("collectionId", None)
+        (raiz / ".outline" / "manifest.json").write_text(
+            json.dumps(estado, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+
 
 class Ambito(Caso):
     def test_baja_solo_la_coleccion_que_se_llama_como_el_proyecto(self):
@@ -566,9 +600,7 @@ class PullNoDestructivo(Caso):
     def test_una_pagina_renombrada_en_outline_se_mueve_en_local(self):
         raiz = self.proyecto("Taller")
         self.ejecutar("pull")
-        identificador = self.identificador(raiz, "albaran.md")
-        self.transporte.documentos[identificador]["title"] = "Albarán de entrega"
-        self.transporte.arboles["col-1"][1]["title"] = "Albarán de entrega"
+        self.retitular(raiz, "albaran.md", "Albarán de entrega")
 
         self.ejecutar("pull")
 
@@ -576,15 +608,38 @@ class PullNoDestructivo(Caso):
         self.assertFalse((raiz / "wiki" / "albaran.md").exists())
         self.assertFalse((raiz / ".outline" / "base" / "albaran.md").exists())
 
+    def test_al_mover_una_pagina_no_pisa_un_fichero_mio_en_el_destino(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        mio = self.crear_local(raiz, "albaran-de-entrega.md", "Notas que Outline no conoce.\n")
+        identificador = self.retitular(raiz, "albaran.md", "Albarán de entrega")
+
+        salida = self.salida("pull")
+
+        self.assertEqual(self.pagina(raiz, "albaran-de-entrega.md"), mio)
+        self.assertIn("Cuerpo del albarán.", self.pagina(raiz, "albaran.md"))
+        self.assertEqual(self.estado(raiz)["documents"][identificador]["path"], "albaran.md")
+        self.assertIn("sin mover porque el destino tiene cambios locales", salida)
+        self.assertIn("wiki/albaran-de-entrega.md", salida)
+
+    def test_liberado_el_destino_la_pasada_siguiente_mueve_la_pagina(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        self.crear_local(raiz, "albaran-de-entrega.md", "Notas que Outline no conoce.\n")
+        self.retitular(raiz, "albaran.md", "Albarán de entrega")
+        self.ejecutar("pull")
+        (raiz / "wiki" / "albaran-de-entrega.md").unlink()
+
+        self.ejecutar("pull")
+
+        self.assertIn("Cuerpo del albarán.", self.pagina(raiz, "albaran-de-entrega.md"))
+        self.assertFalse((raiz / "wiki" / "albaran.md").exists())
 
     def test_dos_paginas_que_se_intercambian_el_titulo_no_se_pisan(self):
         raiz = self.proyecto("Taller")
         self.ejecutar("pull")
-        uno, dos = self.identificador(raiz, "diagnostico.md"), self.identificador(raiz, "albaran.md")
-        for documento, titulo in ((uno, "Albarán"), (dos, "Diagnóstico")):
-            self.transporte.documentos[documento]["title"] = titulo
-        for nodo, titulo in zip(self.transporte.arboles["col-1"], ("Albarán", "Diagnóstico")):
-            nodo["title"] = titulo
+        uno = self.retitular(raiz, "diagnostico.md", "Albarán")
+        dos = self.retitular(raiz, "albaran.md", "Diagnóstico")
 
         self.ejecutar("pull")
 
@@ -619,6 +674,20 @@ class PullBorrados(Caso):
         self.assertEqual(self.pagina(raiz, "albaran.md"), mio)
         self.assertIn(identificador, self.estado(raiz)["documents"])
         self.assertIn("borrada en Outline", salida)
+
+    def test_con_un_manifiesto_heredado_la_pagina_borrada_se_limpia_igual(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        identificador = self.identificador(raiz, "albaran.md")
+        self.degradar_manifiesto(raiz)
+        self.transporte.borrar(identificador)
+
+        self.ejecutar("pull")
+
+        self.assertFalse((raiz / "wiki" / "albaran.md").exists())
+        entradas = self.estado(raiz)["documents"]
+        self.assertNotIn(identificador, entradas)
+        self.assertTrue(all(entrada["collectionId"] == "col-1" for entrada in entradas.values()))
 
     def test_una_coleccion_fuera_de_ambito_no_se_borra(self):
         raiz = self.proyecto("Taller")
@@ -684,6 +753,18 @@ class Status(Caso):
         self.assertNotIn("\n  ", salida)
         self.assertIn("3 limpias", salida)
         self.assertEqual(self.ejecutar("status"), 0)
+
+    def test_un_manifiesto_heredado_no_deja_las_paginas_sin_contar(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        self.degradar_manifiesto(raiz)
+        mio = self.editar_local(raiz, "albaran.md", "Lo que escribí yo.")
+
+        salida = self.salida("status")
+
+        self.assertEqual(self.seccion(salida, "sucias"), ["wiki/albaran.md"])
+        self.assertIn("2 limpias", salida)
+        self.assertEqual(self.pagina(raiz, "albaran.md"), mio)
 
     def test_una_pagina_borrada_en_local_sale_como_sucia(self):
         raiz = self.proyecto("Taller")

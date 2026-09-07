@@ -55,6 +55,8 @@ El `pull` no borra la carpeta.
 Recorre las páginas una a una, actualiza las que no has tocado y deja intactas las que sí,
 listándolas al final.
 Una página que desapareció de Outline se borra en local solo si estaba limpia.
+Renombrarla en Outline la mueve de ruta aquí, pero si en la ruta nueva ya tienes un fichero con
+cambios tuyos, la página se queda donde estaba y el `pull` lo dice en vez de escribir encima.
 
 Cada página tiene tres versiones: la local, en `wiki/`; la base, en `.outline/base/`, que es
 lo que Outline dio en el último `pull`; y la remota.

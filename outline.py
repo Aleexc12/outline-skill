@@ -268,6 +268,15 @@ class Scope:
     def ids(self):
         return {collection["id"] for collection in self.collections}
 
+    @property
+    def names(self):
+        return {collection["name"] for collection in self.collections}
+
+    def covers(self, entry):
+        if "collectionId" in entry:
+            return entry["collectionId"] in self.ids
+        return entry.get("collection") in self.names
+
     def label(self):
         if self.prefixed:
             return "todas las colecciones"
@@ -391,11 +400,7 @@ def pull(client, root, todas):
 
     pages, missing = remote_pages(client, scope)
     untouched = {node["id"] for node in missing}
-    manifest = {
-        i: e
-        for i, e in previous.items()
-        if e.get("collectionId") not in scope.ids or i in untouched
-    }
+    manifest = {i: e for i, e in previous.items() if not scope.covers(e) or i in untouched}
 
     mirror = Mirror.read(wiki)
     shadowed = shadow(shadow_dir)
@@ -406,7 +411,7 @@ def pull(client, root, todas):
         if relative not in destinations:
             discard(directory / relative, directory)
 
-    skipped, updated, removed, entries = [], 0, 0, []
+    skipped, blocked, updated, removed, entries = [], [], 0, 0, []
 
     for page in pages:
         entry = previous.get(page.id)
@@ -415,6 +420,16 @@ def pull(client, root, todas):
 
         if changed(local, shadowed.get(was_at), page.body):
             skipped.append(f"wiki/{was_at}")
+            stays = True
+        elif page.path != was_at and changed(
+            mirror.bodies.get(page.path), shadowed.get(page.path), page.body
+        ):
+            blocked.append(f"wiki/{page.path}, con {page.title} todavía en wiki/{was_at}")
+            stays = True
+        else:
+            stays = False
+
+        if stays:
             if entry:
                 manifest[page.id] = entry
             lives_at = was_at
@@ -437,7 +452,7 @@ def pull(client, root, todas):
 
     seen = {page.id for page in pages} | untouched
     for document_id, entry in previous.items():
-        if document_id in seen or entry.get("collectionId") not in scope.ids:
+        if document_id in seen or not scope.covers(entry):
             continue
         if changed(mirror.bodies.get(entry["path"]), shadowed.get(entry["path"]), None):
             skipped.append(f"wiki/{entry['path']} (borrada en Outline)")
@@ -457,10 +472,13 @@ def pull(client, root, todas):
         partes.append(plural(removed, "borrada aquí", "borradas aquí"))
     if skipped:
         partes.append(f"{len(skipped)} sin tocar")
-    if not updated and not removed and not skipped:
+    if blocked:
+        partes.append(f"{len(blocked)} sin mover")
+    if not updated and not removed and not skipped and not blocked:
         partes.append("todo al día")
     print(f"{', '.join(partes)} -> {wiki}")
     section("sin tocar por tener cambios locales", skipped)
+    section("sin mover porque el destino tiene cambios locales", blocked)
     if missing:
         titles = ", ".join(node["title"] for node in missing)
         print(f"aviso: sin contenido accesible para {len(missing)}: {titles}")
@@ -523,7 +541,7 @@ def status(client, root, todas):
 
     limpias, sucias, adelantadas, conflictos = 0, [], [], []
     for document_id, entry in manifest.items():
-        if entry.get("collectionId") not in scope.ids or document_id in unreadable:
+        if not scope.covers(entry) or document_id in unreadable:
             continue
         page = remote.get(document_id)
         base = shadowed.get(entry["path"])
