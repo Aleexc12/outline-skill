@@ -31,6 +31,8 @@ ARBOL = {
     "Almacén Ñuble": [{"title": "Inventario", "text": "Las existencias."}],
 }
 
+ESCRITURAS = {"documents.create", "documents.update", "documents.move", "documents.delete"}
+
 
 class Transporte:
     """Doble del POST: sirve el árbol guionizado y registra lo que se le pide."""
@@ -42,6 +44,7 @@ class Transporte:
         self.arboles = {}
         self.romper = None
         self.inaccesibles = set()
+        self.creados = 0
         for indice, (nombre, nodos) in enumerate(arbol.items(), start=1):
             coleccion = f"col-{indice}"
             self.colecciones.append({"id": coleccion, "name": nombre})
@@ -50,17 +53,7 @@ class Transporte:
     def _construir(self, nodos, coleccion):
         salida = []
         for nodo in nodos:
-            documento_id = f"doc-{len(self.documentos) + 1:03d}"
-            self.documentos[documento_id] = {
-                "id": documento_id,
-                "title": nodo["title"],
-                "text": nodo["text"],
-                "revision": 1,
-                "updatedAt": "2026-09-07T00:00:00.000Z",
-                "urlId": documento_id,
-                "url": f"/doc/{documento_id}",
-                "collectionId": coleccion,
-            }
+            documento_id = self._alta(nodo["title"], nodo["text"], coleccion)
             salida.append(
                 {
                     "id": documento_id,
@@ -69,6 +62,21 @@ class Transporte:
                 }
             )
         return salida
+
+    def _alta(self, titulo, texto, coleccion):
+        self.creados += 1
+        documento_id = f"doc-{self.creados:03d}"
+        self.documentos[documento_id] = {
+            "id": documento_id,
+            "title": titulo,
+            "text": texto,
+            "revision": 1,
+            "updatedAt": "2026-09-07T00:00:00.000Z",
+            "urlId": documento_id,
+            "url": f"/doc/{documento_id}",
+            "collectionId": coleccion,
+        }
+        return documento_id
 
     def post(self, endpoint, payload):
         self.peticiones.append((endpoint, payload))
@@ -80,7 +88,7 @@ class Transporte:
             coleccion = payload.get("collectionId")
             return self._pagina(
                 [
-                    d for d in self.documentos.values()
+                    dict(d) for d in self.documentos.values()
                     if d["collectionId"] == coleccion and d["id"] not in self.inaccesibles
                 ]
             )
@@ -89,14 +97,73 @@ class Transporte:
         if endpoint == "documents.info":
             if payload["id"] in self.inaccesibles:
                 return {"data": None}
-            return {"data": self.documentos[payload["id"]]}
+            return {"data": dict(self.documentos[payload["id"]])}
+        if endpoint == "documents.update":
+            documento = self.documentos[payload["id"]]
+            documento["text"] = payload["text"]
+            documento["revision"] += 1
+            if payload.get("title"):
+                self.retitular(payload["id"], payload["title"])
+            return {"data": dict(documento)}
+        if endpoint == "documents.create":
+            padre = payload.get("parentDocumentId")
+            coleccion = payload.get("collectionId") or self.documentos[padre]["collectionId"]
+            documento_id = self._alta(payload["title"], payload["text"], coleccion)
+            nodo = {"id": documento_id, "title": payload["title"], "children": []}
+            nivel = self.arboles[coleccion]
+            if padre:
+                nivel = self._buscar(nivel, padre)["children"]
+            nivel.insert(0, nodo)
+            return {"data": dict(self.documentos[documento_id])}
+        if endpoint == "documents.move":
+            documento = self.documentos[payload["id"]]
+            nodo = self._buscar(self.arboles[documento["collectionId"]], payload["id"])
+            for coleccion, arbol in self.arboles.items():
+                self.arboles[coleccion] = self._podar(arbol, payload["id"])
+            coleccion = payload.get("collectionId") or documento["collectionId"]
+            padre = payload.get("parentDocumentId")
+            nivel = self.arboles[coleccion]
+            if padre:
+                nivel = self._buscar(nivel, padre)["children"]
+            nivel.insert(min(payload.get("index", 0), len(nivel)), nodo)
+            documento["collectionId"] = coleccion
+            documento["revision"] += 1
+            return {"data": {"documents": [dict(documento)], "collections": []}}
         raise AssertionError(f"endpoint no guionizado: {endpoint}")
+
+    def _buscar(self, nodos, documento_id):
+        for nodo in nodos:
+            if nodo["id"] == documento_id:
+                return nodo
+            encontrado = self._buscar(nodo["children"], documento_id)
+            if encontrado:
+                return encontrado
+        return None
 
     def editar(self, documento_id, texto):
         """Un socio edita esa página en Outline, lo que adelanta su revisión."""
         documento = self.documentos[documento_id]
         documento["text"] = texto
         documento["revision"] += 1
+
+    def retitular(self, documento_id, titulo):
+        self.documentos[documento_id]["title"] = titulo
+        for coleccion, arbol in self.arboles.items():
+            self.arboles[coleccion] = self._retitular(arbol, documento_id, titulo)
+
+    def _retitular(self, nodos, documento_id, titulo):
+        return [
+            {
+                **nodo,
+                "title": titulo if nodo["id"] == documento_id else nodo["title"],
+                "children": self._retitular(nodo["children"], documento_id, titulo),
+            }
+            for nodo in nodos
+        ]
+
+    def escrituras(self):
+        """Las peticiones que cambian algo en Outline, en el orden en que se hicieron."""
+        return [(e, p) for e, p in self.peticiones if e in ESCRITURAS]
 
     def borrar(self, documento_id):
         del self.documentos[documento_id]
@@ -191,20 +258,33 @@ class Caso(unittest.TestCase):
     def retitular(self, raiz, ruta, titulo):
         """Renombra en Outline la página que hoy vive en esa ruta. Devuelve su identificador."""
         identificador = self.identificador(raiz, ruta)
-        self.transporte.documentos[identificador]["title"] = titulo
-        for coleccion, arbol in self.transporte.arboles.items():
-            self.transporte.arboles[coleccion] = self._retitular(arbol, identificador, titulo)
+        self.transporte.retitular(identificador, titulo)
         return identificador
 
-    def _retitular(self, nodos, identificador, titulo):
-        return [
-            {
-                **nodo,
-                "title": titulo if nodo["id"] == identificador else nodo["title"],
-                "children": self._retitular(nodo["children"], identificador, titulo),
-            }
-            for nodo in nodos
-        ]
+    def olvidar(self, raiz, ruta):
+        """Deja la página solo con la identidad de su frontmatter, sin base ni manifiesto."""
+        identificador = self.identificador(raiz, ruta)
+        (raiz / ".outline" / "base" / ruta).unlink()
+        estado = self.estado(raiz)
+        del estado["documents"][identificador]
+        (raiz / ".outline" / "manifest.json").write_text(
+            json.dumps(estado, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        return identificador
+
+    def identificador_remoto(self, titulo):
+        return next(d["id"] for d in self.transporte.documentos.values() if d["title"] == titulo)
+
+    def montar_conflicto(self):
+        """Una página cambiada aquí y en Outline desde el último pull."""
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        self.editar_local(raiz, "diagnostico.md", "Lo que escribí yo.")
+        self.transporte.editar(
+            self.identificador(raiz, "diagnostico.md"),
+            "Cuerpo del diagnóstico.\n\nLo que escribió mi socia.",
+        )
+        return raiz
 
     def degradar_manifiesto(self, raiz):
         """El manifiesto como lo escribía la versión anterior, sin el id de la colección."""
@@ -819,6 +899,518 @@ class Status(Caso):
         self.proyecto("Taller")
 
         self.assertIn("outline pull", self.ejecutar_fallando("status"))
+
+
+class Push(Caso):
+    def preparar(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        self.transporte.peticiones.clear()
+        return raiz
+
+    def test_sube_solo_las_paginas_sucias(self):
+        raiz = self.preparar()
+        self.editar_local(raiz, "diagnostico.md", "Una línea mía.")
+
+        self.ejecutar("push")
+
+        escrituras = self.transporte.escrituras()
+        self.assertEqual([e for e, _ in escrituras], ["documents.update"])
+        self.assertEqual(escrituras[0][1]["id"], self.identificador(raiz, "diagnostico.md"))
+
+    def test_sin_cambios_no_escribe_nada(self):
+        self.preparar()
+
+        self.ejecutar("push")
+
+        self.assertEqual(self.transporte.escrituras(), [])
+
+    def test_lo_que_sube_es_lo_que_tengo_en_local(self):
+        raiz = self.preparar()
+        self.editar_local(raiz, "diagnostico.md", "Una línea mía.")
+
+        self.ejecutar("push")
+
+        documento = self.transporte.documentos[self.identificador(raiz, "diagnostico.md")]
+        self.assertEqual(documento["text"], "Cuerpo del diagnóstico.\n\nUna línea mía.")
+        self.assertEqual(documento["title"], "Diagnóstico")
+
+    def test_el_cuerpo_que_sube_no_lleva_el_frontmatter(self):
+        raiz = self.preparar()
+        self.editar_local(raiz, "diagnostico.md", "Una línea mía.")
+        self.crear_local(raiz, "nota.md", "# Nota\n\nRecién escrita.\n")
+
+        self.ejecutar("push")
+
+        for endpoint, payload in self.transporte.escrituras():
+            self.assertNotIn("outline_id", json.dumps(payload), endpoint)
+            self.assertFalse(payload.get("text", "").startswith("---"), endpoint)
+
+    def test_el_cuerpo_que_sube_no_repite_el_titulo_como_encabezado(self):
+        raiz = self.preparar()
+        self.editar_local(raiz, "diagnostico.md", "Una línea mía.")
+
+        self.ejecutar("push")
+
+        self.assertNotIn("# Diagnóstico", self.transporte.escrituras()[0][1]["text"])
+
+    def test_tras_subir_la_pagina_queda_limpia(self):
+        raiz = self.preparar()
+        local = self.editar_local(raiz, "diagnostico.md", "Una línea mía.")
+
+        self.ejecutar("push")
+
+        self.assertEqual(self.base(raiz, "diagnostico.md"), outline.strip_frontmatter(local))
+        self.assertIn("0 sucias", self.salida("status"))
+
+    def test_tras_subir_el_manifiesto_guarda_la_revision_nueva(self):
+        raiz = self.preparar()
+        self.editar_local(raiz, "diagnostico.md", "Una línea mía.")
+
+        self.ejecutar("push")
+
+        identificador = self.identificador(raiz, "diagnostico.md")
+        revision = self.transporte.documentos[identificador]["revision"]
+        self.assertEqual(self.estado(raiz)["documents"][identificador]["revision"], revision)
+
+    def test_el_pull_siguiente_no_deshace_lo_subido(self):
+        raiz = self.preparar()
+        local = self.editar_local(raiz, "diagnostico.md", "Una línea mía.")
+
+        self.ejecutar("push")
+        self.ejecutar("pull")
+
+        self.assertEqual(self.pagina(raiz, "diagnostico.md"), local)
+
+    def test_se_niega_si_la_remota_se_adelanto(self):
+        raiz = self.preparar()
+        identificador = self.identificador(raiz, "diagnostico.md")
+        mio = self.editar_local(raiz, "diagnostico.md", "Una línea mía.")
+        self.transporte.editar(
+            identificador, "Cuerpo del diagnóstico.\n\nLo que escribió mi socia."
+        )
+
+        salida = self.salida("push")
+
+        self.assertEqual(self.transporte.escrituras(), [])
+        self.assertIn("conflicto", salida.lower())
+        self.assertIn("wiki/diagnostico.md", salida)
+        self.assertEqual(self.pagina(raiz, "diagnostico.md"), mio)
+        self.assertIn(
+            "Lo que escribió mi socia.", self.transporte.documentos[identificador]["text"]
+        )
+
+    def test_una_pagina_en_conflicto_no_frena_a_las_demas(self):
+        raiz = self.preparar()
+        self.editar_local(raiz, "diagnostico.md", "Una línea mía.")
+        self.editar_local(raiz, "albaran.md", "Otra línea mía.")
+        self.transporte.editar(self.identificador(raiz, "diagnostico.md"), "Lo de mi socia.")
+
+        self.ejecutar("push")
+
+        subidos = [p["id"] for _, p in self.transporte.escrituras()]
+        self.assertEqual(subidos, [self.identificador(raiz, "albaran.md")])
+
+    def test_un_fichero_sin_identidad_crea_la_pagina(self):
+        raiz = self.preparar()
+        self.crear_local(raiz, "presupuesto.md", "# Presupuesto\n\nLo que cuesta.\n")
+
+        self.ejecutar("push")
+
+        endpoint, payload = self.transporte.escrituras()[0]
+        self.assertEqual(endpoint, "documents.create")
+        self.assertEqual(payload["title"], "Presupuesto")
+        self.assertEqual(payload["text"], "Lo que cuesta.")
+        self.assertEqual(payload["collectionId"], "col-1")
+        self.assertTrue(payload["publish"])
+        self.assertIsNone(payload.get("parentDocumentId"))
+
+    def test_el_identificador_devuelto_se_escribe_en_el_frontmatter(self):
+        raiz = self.preparar()
+        self.crear_local(raiz, "presupuesto.md", "# Presupuesto\n\nLo que cuesta.\n")
+
+        self.ejecutar("push")
+
+        identificador = max(self.transporte.documentos)
+        self.assertEqual(
+            self.pagina(raiz, "presupuesto.md"),
+            f"---\noutline_id: {identificador}\n---\n\n# Presupuesto\n\nLo que cuesta.\n",
+        )
+        self.assertEqual(self.estado(raiz)["documents"][identificador]["path"], "presupuesto.md")
+
+    def test_una_pagina_recien_creada_queda_limpia(self):
+        raiz = self.preparar()
+        self.crear_local(raiz, "presupuesto.md", "# Presupuesto\n\nLo que cuesta.\n")
+
+        self.ejecutar("push")
+
+        salida = self.salida("status")
+        self.assertNotIn("presupuesto.md", salida)
+        self.assertIn("0 sucias", salida)
+        self.assertEqual(self.base(raiz, "presupuesto.md"), "# Presupuesto\n\nLo que cuesta.\n")
+
+    def test_la_carpeta_dice_de_que_pagina_cuelga(self):
+        raiz = self.preparar()
+        self.crear_local(raiz, "diagnostico/compresion.md", "# Compresión\n\nLos cilindros.\n")
+
+        self.ejecutar("push")
+
+        _, payload = self.transporte.escrituras()[0]
+        self.assertEqual(payload["parentDocumentId"], self.identificador(raiz, "diagnostico.md"))
+        self.assertEqual(payload["collectionId"], "col-1")
+
+    def test_con_all_la_coleccion_sale_del_primer_segmento(self):
+        raiz = self.proyecto("Cualquiera")
+        self.ejecutar("pull", "--all")
+        self.transporte.peticiones.clear()
+        self.crear_local(raiz, "almacen-nuble/roturas.md", "# Roturas\n\nLo que se rompió.\n")
+
+        self.ejecutar("push", "--all")
+
+        _, payload = self.transporte.escrituras()[0]
+        self.assertEqual(payload["collectionId"], "col-2")
+        self.assertIsNone(payload.get("parentDocumentId"))
+
+    def test_una_pagina_nueva_sin_madre_no_se_crea_y_no_frena_a_las_demas(self):
+        raiz = self.preparar()
+        self.crear_local(raiz, "chapa/pintura.md", "# Pintura\n\nEl color.\n")
+        self.editar_local(raiz, "albaran.md", "Una línea mía.")
+
+        salida = self.salida("push")
+
+        self.assertIn("wiki/chapa/pintura.md", salida)
+        self.assertIn("wiki/chapa.md", salida)
+        subidos = [p["id"] for _, p in self.transporte.escrituras()]
+        self.assertEqual(subidos, [self.identificador(raiz, "albaran.md")])
+
+    def test_una_pagina_nueva_sin_encabezado_no_se_crea_y_lo_dice(self):
+        raiz = self.preparar()
+        self.crear_local(raiz, "presupuesto.md", "Lo que cuesta, sin título.\n")
+
+        salida = self.salida("push")
+
+        self.assertIn("wiki/presupuesto.md", salida)
+        self.assertIn("encabezado", salida)
+        self.assertEqual(self.transporte.escrituras(), [])
+
+    def test_las_paginas_nuevas_se_crean_de_fuera_hacia_dentro_y_en_orden(self):
+        raiz = self.preparar()
+        self.crear_local(raiz, "presupuesto.md", "# Presupuesto\n\nLo que cuesta.\n")
+        self.crear_local(raiz, "chapa.md", "# Chapa\n\nEl taller de chapa.\n")
+        self.crear_local(raiz, "chapa/pintura.md", "# Pintura\n\nEl color.\n")
+
+        self.ejecutar("push")
+
+        creadas = [p["title"] for e, p in self.transporte.escrituras() if e == "documents.create"]
+        self.assertEqual(creadas, ["Chapa", "Presupuesto", "Pintura"])
+
+    def test_una_pagina_nueva_acaba_al_final_de_su_nivel(self):
+        raiz = self.preparar()
+        self.crear_local(raiz, "presupuesto.md", "# Presupuesto\n\nLo que cuesta.\n")
+
+        self.ejecutar("push")
+        self.ejecutar("pull")
+
+        indice = (raiz / ".outline" / "index.md").read_text(encoding="utf-8")
+        titulos = [re.search(r"\[(.+?)\]", l).group(1) for l in indice.splitlines() if "- [" in l]
+        self.assertEqual(titulos, ["Diagnóstico", "Auditoría de ruido", "Albarán", "Presupuesto"])
+
+    def test_una_pagina_nueva_anidada_acaba_al_final_de_su_nivel(self):
+        raiz = self.preparar()
+        self.crear_local(raiz, "diagnostico/revision.md", "# Revisión\n\nLo revisado.\n")
+
+        self.ejecutar("push")
+        self.ejecutar("pull")
+
+        indice = (raiz / ".outline" / "index.md").read_text(encoding="utf-8")
+        hijas = [re.search(r"\[(.+?)\]", l).group(1) for l in indice.splitlines() if "  - [" in l]
+        self.assertEqual(hijas, ["Auditoría de ruido", "Revisión"])
+
+    def test_la_revision_que_se_apunta_es_la_de_despues_de_colocarla(self):
+        raiz = self.preparar()
+        self.crear_local(raiz, "presupuesto.md", "# Presupuesto\n\nLo que cuesta.\n")
+
+        self.ejecutar("push")
+
+        identificador = self.identificador(raiz, "presupuesto.md")
+        apuntada = self.estado(raiz)["documents"][identificador]["revision"]
+        self.assertEqual(apuntada, self.transporte.documentos[identificador]["revision"])
+
+    def test_la_pagina_recien_creada_se_vuelve_a_subir_sin_conflicto_falso(self):
+        raiz = self.preparar()
+        self.crear_local(raiz, "presupuesto.md", "# Presupuesto\n\nLo que cuesta.\n")
+        self.ejecutar("push")
+
+        self.editar_local(raiz, "presupuesto.md", "Y una línea más.")
+        salida = self.salida("push")
+
+        self.assertIn("1 página subida", salida)
+        self.assertNotIn("en conflicto", salida)
+
+    def test_una_pagina_nueva_cuelga_de_otra_pagina_nueva(self):
+        raiz = self.preparar()
+        self.crear_local(raiz, "chapa.md", "# Chapa\n\nEl taller de chapa.\n")
+        self.crear_local(raiz, "chapa/pintura.md", "# Pintura\n\nEl color.\n")
+
+        self.ejecutar("push")
+        self.ejecutar("pull")
+
+        padre = self.identificador(raiz, "chapa.md")
+        creaciones = [p for e, p in self.transporte.escrituras() if e == "documents.create"]
+        self.assertEqual(creaciones[1]["parentDocumentId"], padre)
+        self.assertTrue((raiz / "wiki" / "chapa" / "pintura.md").is_file())
+
+    def test_dos_ficheros_con_la_misma_identidad_abortan_antes_de_escribir(self):
+        raiz = self.preparar()
+        copia = self.pagina(raiz, "diagnostico.md")
+        self.crear_local(raiz, "copia-del-diagnostico.md", copia.replace("Cuerpo", "Otro cuerpo"))
+
+        mensaje = self.ejecutar_fallando("push")
+
+        self.assertIn("wiki/diagnostico.md", mensaje)
+        self.assertIn("wiki/copia-del-diagnostico.md", mensaje)
+        self.assertEqual(self.transporte.escrituras(), [])
+
+    def test_dos_ficheros_con_la_misma_identidad_abortan_aunque_una_pierda_el_frontmatter(self):
+        raiz = self.preparar()
+        original = self.pagina(raiz, "diagnostico.md")
+        self.crear_local(raiz, "copia-del-diagnostico.md", original)
+        (raiz / "wiki" / "diagnostico.md").write_text(
+            outline.strip_frontmatter(original), encoding="utf-8"
+        )
+
+        mensaje = self.ejecutar_fallando("push")
+
+        self.assertIn("wiki/diagnostico.md", mensaje)
+        self.assertIn("wiki/copia-del-diagnostico.md", mensaje)
+        self.assertEqual(self.transporte.escrituras(), [])
+
+    def test_un_cuerpo_que_empieza_por_tres_guiones_no_se_pierde_al_subir(self):
+        raiz = self.preparar()
+        identificador = self.identificador(raiz, "diagnostico.md")
+        (raiz / "wiki" / "diagnostico.md").write_text(
+            outline.frontmatter(identificador)
+            + "---\nnota: esto es cuerpo, no metadatos\n---\n\n# Diagnóstico\n\nCuerpo.\n",
+            encoding="utf-8",
+        )
+
+        self.ejecutar("push")
+
+        texto = self.transporte.documentos[identificador]["text"]
+        self.assertIn("nota: esto es cuerpo, no metadatos", texto)
+
+    def test_se_niega_si_la_revision_avanzo_aunque_el_cuerpo_vuelva_a_ser_el_de_la_base(self):
+        raiz = self.preparar()
+        identificador = self.identificador(raiz, "diagnostico.md")
+        original = self.transporte.documentos[identificador]["text"]
+        self.editar_local(raiz, "diagnostico.md", "Lo que escribí yo.")
+        self.transporte.editar(identificador, "Un desvío de mi socia.")
+        self.transporte.editar(identificador, original)
+
+        salida = self.salida("push")
+
+        self.assertIn("en conflicto", salida)
+        self.assertEqual(self.transporte.escrituras(), [])
+
+    def test_una_pagina_que_se_fue_a_otra_coleccion_no_se_apunta_en_la_de_aqui(self):
+        raiz = self.preparar()
+        identificador = self.identificador(raiz, "diagnostico.md")
+        self.editar_local(raiz, "diagnostico.md", "Una línea mía.")
+        self.transporte.documentos[identificador]["collectionId"] = "col-2"
+
+        salida = self.salida("push")
+
+        self.assertIn("sin comparar", salida)
+        self.assertEqual(self.transporte.escrituras(), [])
+        self.assertEqual(self.estado(raiz)["documents"][identificador]["collection"], "Taller")
+
+    def test_si_el_ultimo_pull_no_termino_el_push_lo_avisa(self):
+        raiz = self.preparar()
+        self.transporte.inaccesibles.add(self.identificador_remoto("Albarán"))
+        self.ejecutar("pull")
+        self.editar_local(raiz, "diagnostico.md", "Una línea mía.")
+
+        salida = self.salida("push")
+
+        self.assertIn("aviso", salida)
+        self.assertIn("outline pull", salida)
+
+    def test_sin_cambios_no_le_pregunta_a_outline_por_ninguna_pagina(self):
+        self.preparar()
+
+        self.ejecutar("push")
+
+        pedidas = [e for e, _ in self.transporte.peticiones if e == "documents.info"]
+        self.assertEqual(pedidas, [])
+
+    def test_lo_que_ya_esta_en_outline_solo_adelanta_la_base(self):
+        raiz = self.preparar()
+        local = self.editar_local(raiz, "diagnostico.md", "Una línea mía.")
+        self.transporte.editar(
+            self.identificador(raiz, "diagnostico.md"),
+            "Cuerpo del diagnóstico.\n\nUna línea mía.",
+        )
+
+        salida = self.salida("push")
+
+        self.assertEqual(self.transporte.escrituras(), [])
+        self.assertIn("ya estaba en Outline", salida)
+        self.assertEqual(self.base(raiz, "diagnostico.md"), outline.strip_frontmatter(local))
+        self.assertIn("0 sucias", self.salida("status"))
+
+    def montar_sin_base(self):
+        """Una página cambiada aquí y en Outline, y de la que se perdió la base."""
+        raiz = self.preparar()
+        self.olvidar(raiz, "diagnostico.md")
+        identificador = self.identificador_remoto("Diagnóstico")
+        self.editar_local(raiz, "diagnostico.md", "Lo que escribí yo.")
+        self.transporte.editar(identificador, "Cuerpo del diagnóstico.\n\nLo de mi socia.")
+        return raiz, identificador
+
+    def test_una_pagina_sin_base_no_se_sube_a_ciegas(self):
+        _, identificador = self.montar_sin_base()
+
+        salida = self.salida("push")
+
+        self.assertEqual(self.transporte.escrituras(), [])
+        self.assertIn("wiki/diagnostico.md", salida)
+        self.assertIn("outline resolve", salida)
+        self.assertIn("Lo de mi socia.", self.transporte.documentos[identificador]["text"])
+
+    def test_resuelta_esa_pagina_el_push_siguiente_la_sube(self):
+        _, identificador = self.montar_sin_base()
+
+        self.ejecutar("resolve", "Diagnóstico")
+        self.ejecutar("push")
+
+        texto = self.transporte.documentos[identificador]["text"]
+        self.assertIn("Lo que escribí yo.", texto)
+        self.assertNotIn("Lo de mi socia.", texto)
+
+    def test_si_el_frontmatter_se_perdio_el_identificador_sale_del_manifiesto(self):
+        raiz = self.preparar()
+        identificador = self.identificador(raiz, "diagnostico.md")
+        (raiz / "wiki" / "diagnostico.md").write_text(
+            "# Diagnóstico\n\nCuerpo del diagnóstico.\n\nUna línea mía.\n", encoding="utf-8"
+        )
+
+        self.ejecutar("push")
+
+        escrituras = self.transporte.escrituras()
+        self.assertEqual([e for e, _ in escrituras], ["documents.update"])
+        self.assertEqual(escrituras[0][1]["id"], identificador)
+        self.assertIn("Una línea mía.", self.transporte.documentos[identificador]["text"])
+
+    def test_sin_manifiesto_pide_un_pull(self):
+        self.proyecto("Taller")
+
+        self.assertIn("outline pull", self.ejecutar_fallando("push"))
+
+    def test_las_paginas_de_otra_coleccion_no_se_tocan(self):
+        raiz = self.proyecto("Cualquiera")
+        self.ejecutar("pull", "--all")
+        self.editar_local(raiz, "almacen-nuble/inventario.md", "Una línea mía.")
+        self.transporte.peticiones.clear()
+
+        self.ejecutar("push", "--all")
+
+        subidos = [p["id"] for _, p in self.transporte.escrituras()]
+        self.assertEqual(subidos, [self.identificador(raiz, "almacen-nuble/inventario.md")])
+
+
+class Marcadores(Caso):
+    """En Markdown no hay compilador que avise, así que ningún comando escribe marcadores."""
+
+    def test_ningun_comando_escribe_marcadores_de_conflicto(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        self.editar_local(raiz, "diagnostico.md", "Una línea mía.")
+        self.transporte.editar(
+            self.identificador(raiz, "diagnostico.md"), "Lo que escribió mi socia."
+        )
+
+        for comando in ("status", "diff", "push", "pull", "status"):
+            self.ejecutar(comando)
+
+        for pagina in (raiz / "wiki").rglob("*.md"):
+            texto = pagina.read_text(encoding="utf-8")
+            for marcador in ("<<<<<<<", "=======", ">>>>>>>"):
+                self.assertNotIn(marcador, texto, f"{pagina} tras los comandos")
+
+
+class Diff(Caso):
+    def test_ensena_el_diff_de_lo_mio_y_el_de_outline_contra_la_base(self):
+        self.montar_conflicto()
+
+        salida = self.salida("diff")
+
+        self.assertIn("+Lo que escribí yo.", salida)
+        self.assertIn("+Lo que escribió mi socia.", salida)
+        self.assertIn("wiki/diagnostico.md", salida)
+
+    def test_distingue_de_quien_es_cada_diff(self):
+        self.montar_conflicto()
+
+        salida = self.salida("diff")
+
+        mio = salida.index("+Lo que escribí yo.")
+        suyo = salida.index("+Lo que escribió mi socia.")
+        self.assertLess(salida.index("base -> local"), mio)
+        self.assertLess(mio, salida.index("base -> remoto"))
+        self.assertLess(salida.index("base -> remoto"), suyo)
+
+    def test_sin_conflictos_no_ensena_nada(self):
+        self.proyecto("Taller")
+        self.ejecutar("pull")
+
+        salida = self.salida("diff")
+
+        self.assertNotIn("@@", salida)
+        self.assertIn("sin conflictos", salida)
+
+    def test_una_pagina_concreta_se_puede_pedir_por_su_titulo(self):
+        self.montar_conflicto()
+
+        salida = self.salida("diff", "Albarán")
+
+        self.assertIn("wiki/albaran.md", salida)
+        self.assertNotIn("diagnostico.md", salida)
+
+
+class Resolver(Caso):
+    def test_marcar_resuelto_adelanta_la_base_al_remoto(self):
+        raiz = self.montar_conflicto()
+
+        self.ejecutar("resolve", "Diagnóstico")
+
+        self.assertIn("Lo que escribió mi socia.", self.base(raiz, "diagnostico.md"))
+        salida = self.salida("status")
+        self.assertIn("0 en conflicto", salida)
+        self.assertIn("1 sucia", salida)
+
+    def test_marcar_resuelto_no_toca_el_fichero_local(self):
+        raiz = self.montar_conflicto()
+        mio = self.pagina(raiz, "diagnostico.md")
+
+        self.ejecutar("resolve", "Diagnóstico")
+
+        self.assertEqual(self.pagina(raiz, "diagnostico.md"), mio)
+
+    def test_resuelto_el_conflicto_el_push_sube_mi_version(self):
+        raiz = self.montar_conflicto()
+
+        self.ejecutar("resolve", "Diagnóstico")
+        self.ejecutar("push")
+
+        identificador = self.identificador(raiz, "diagnostico.md")
+        texto = self.transporte.documentos[identificador]["text"]
+        self.assertIn("Lo que escribí yo.", texto)
+        self.assertNotIn("Lo que escribió mi socia.", texto)
+
+    def test_sin_decir_que_pagina_falla(self):
+        self.montar_conflicto()
+
+        self.ejecutar_fallando("resolve")
 
 
 class Configuracion(Caso):

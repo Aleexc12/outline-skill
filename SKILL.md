@@ -13,21 +13,24 @@ Los comandos se ejecutan desde la raíz del proyecto.
 
 ## Reglas
 
-1. **Editar `wiki/` a mano no publica nada todavía.**
-   El `pull` ya no borra la carpeta, así que un cambio local sobrevive.
-   Pero `push` aún no existe: para que ese cambio llegue a Outline hay que escribirlo por API,
-   y mientras tanto el `pull` se salta esa página y su copia se queda vieja.
-2. **Leer siempre en local, escribir siempre por API.**
+1. **Editar el `.md` y hacer `outline push` es la forma de escribir.**
+   El `push` sube solo las páginas que has tocado, manda el cuerpo sin el frontmatter y saca
+   el título del encabezado de nivel 1.
+   Un `.md` nuevo en la carpeta que le toca crea la página, con la colección y la madre
+   deducidas de su ruta.
+   Si esa página se movió en Outline desde tu último `pull`, el `push` no la toca y lo dice.
+   `outline diff` enseña los dos lados y `outline resolve` da el conflicto por resuelto.
+   Escribir por API, más abajo, es para lo que no cabe en un fichero.
+2. **Leer siempre en local.**
    Un documento por `documents.info` cuesta de 4 a 6 veces más contexto que su `.md`.
 3. **Antes de escribir: `status`, o `check` de esa página, y `pull` si está desactualizada.**
-   Sin la copia fresca, el `findText` de un `patch` no coincide con el texto real.
-   Para una página nueva no hay nada que comprobar, así que ahí se baja directamente:
+   Editar sobre una copia vieja acaba en un conflicto que el `push` rebota, y en rehacer
+   el trabajo.
+   Para una página nueva no hay nada que comprobar, así que ahí se baja directamente, que
    hace falta para ver el árbol actual, elegir dónde colocarla y no duplicar algo que ya existe.
-4. **Preferir `patch` y `append` frente a `replace`.**
-   Una reescritura completa pisa el trabajo de quien esté editando otra sección.
-5. **Filtrar toda respuesta de la API con `jq`.**
+4. **Filtrar toda respuesta de la API con `jq`.**
    Las respuestas traen el documento entero más su árbol JSON del editor.
-6. **Construir el cuerpo con `jq -n --arg` y enviarlo por stdin con `--data-binary @-`.**
+5. **Construir el cuerpo con `jq -n --arg` y enviarlo por stdin con `--data-binary @-`.**
    Pasar el JSON dentro de `-d "..."` corrompe las tildes y las eñes: en Windows los
    argumentos de proceso pasan por la página de códigos del sistema y el UTF-8 se pierde.
    El título llega a Outline con `�` en lugar de cada acento, y como Outline es la
@@ -66,12 +69,12 @@ outline status        # la colección del proyecto
 outline status --all  # todas
 ```
 
-| local vs base | remoto vs base | Estado | Qué hace el `pull` |
-|---|---|---|---|
-| igual | igual | limpia | nada |
-| igual | cambió | remota adelantada | actualiza local y base |
-| cambió | igual | sucia | no la toca |
-| cambió | cambió | conflicto | no la toca |
+| local vs base | remoto vs base | Estado | `pull` | `push` |
+|---|---|---|---|---|
+| igual | igual | limpia | nada | nada |
+| igual | cambió | remota adelantada | actualiza local y base | nada |
+| cambió | igual | sucia | no la toca | sube y adelanta la base |
+| cambió | cambió | conflicto | no la toca | se niega |
 
 `status` lista las que no están limpias, y aparte los ficheros que aún no existen en Outline.
 Para una página suelta, `check` compara su revisión con la del remoto y sale con código 1 si
@@ -83,6 +86,23 @@ outline check "nombre de la pagina"
 ```
 
 ## Escribir
+
+Editando el fichero y empujándolo:
+
+```bash
+outline push            # sube lo tocado y crea los .md que no están en Outline
+outline diff "pagina"   # los dos diffs contra la base, el tuyo y el de Outline
+outline resolve "pagina" # da el conflicto por resuelto, sin tocar tu fichero
+```
+
+El `push` nunca escribe marcadores de conflicto dentro de un fichero.
+El cuerpo que manda no lleva el frontmatter ni repite el título, y el identificador de una
+página recién creada vuelve al frontmatter del fichero local.
+
+Por API, para lo que no es el texto de una página.
+Ahí no hay comprobación de revisión que pare nada, así que un `replace` del cuerpo entero pisa
+a quien esté editando otra sección.
+Con `patch` y `append` el cambio se queda en lo que tocas.
 
 El token y la dirección viven en las variables de entorno de usuario, así que ya están puestos:
 

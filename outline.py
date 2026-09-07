@@ -5,6 +5,7 @@ Solo usa la biblioteca estándar, así que clonar y ejecutar funciona sin instal
 """
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -13,12 +14,12 @@ import sys
 import unicodedata
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 PAGE_SIZE = 100
 STATE_DIR = ".outline"
-FRONTMATTER = re.compile(r"\A---\n.*?\n---\n+", re.DOTALL)
+FRONTMATTER = re.compile(r"\A---\n(?P<meta>.*?)\n---\n+", re.DOTALL)
 IDENTITY = re.compile(r"\A---\s*\noutline_id:\s*(\S+)\s*\n---")
 
 WINDOWS_RESERVED = {
@@ -198,7 +199,11 @@ def frontmatter(document_id):
 
 
 def strip_frontmatter(text):
-    return FRONTMATTER.sub("", text, count=1)
+    """Un `---` que abre el cuerpo es contenido, así que solo se quita el frontmatter propio."""
+    match = FRONTMATTER.match(text)
+    if match and "outline_id:" in match.group("meta"):
+        return text[match.end():]
+    return text
 
 
 def page_body(title, text):
@@ -240,6 +245,10 @@ class Page:
     depth: int
 
 
+def fetch_document(client, document_id):
+    return (client.post("documents.info", {"id": document_id}) or {}).get("data")
+
+
 def remote_documents(client, selected):
     documents = {}
     for collection in selected:
@@ -259,10 +268,20 @@ class Scope:
     documents: dict
 
     @classmethod
-    def read(cls, client, root, todas):
+    def only_collections(cls, client, root, todas):
+        """El ámbito sin bajarse los documentos, para lo que solo necesita la colección."""
         available = list(client.paginate("collections.list", {}))
         selected, prefixed = matching_collections(available, root, todas)
-        return cls(selected, prefixed, remote_documents(client, selected))
+        return cls(selected, prefixed, {})
+
+    @classmethod
+    def read(cls, client, root, todas):
+        scope = cls.only_collections(client, root, todas)
+        scope.documents = remote_documents(client, scope.collections)
+        return scope
+
+    def by_id(self, collection_id):
+        return next((c for c in self.collections if c["id"] == collection_id), None)
 
     @property
     def ids(self):
@@ -295,7 +314,7 @@ def remote_pages(client, scope):
         for node in nodes:
             document = scope.documents.get(node["id"])
             if document is None:
-                document = (client.post("documents.info", {"id": node["id"]}) or {}).get("data")
+                document = fetch_document(client, node["id"])
             if document is None:
                 missing.append(node)
                 continue
@@ -364,8 +383,8 @@ def changed(local, base, remote):
     return local != base and local != remote
 
 
-def advanced(page, entry, base):
-    """Si Outline se movió respecto de la base que dejó el último pull."""
+def advanced_by_body(page, entry, base):
+    """Si Outline se movió, mirando el cuerpo y la ruta que trae el árbol del pull."""
     if page is None:
         return True
     if base is None:
@@ -485,11 +504,15 @@ def pull(client, root, todas):
     return 0
 
 
-def load_manifest(root):
+def load_state(root):
     state = read_manifest(root)
     if not state:
         fail(f"no hay manifiesto en {manifest_path(root)}. Ejecuta 'outline pull' primero.")
-    return state["documents"]
+    return state
+
+
+def load_manifest(root):
+    return load_state(root)["documents"]
 
 
 def title_of(root, entry):
@@ -503,7 +526,7 @@ def title_of(root, entry):
     return entry["path"]
 
 
-def resolve(root, manifest, needle):
+def find_page(root, manifest, needle):
     """Acepta un id exacto, una ruta dentro de wiki/ o un trozo del título."""
     if needle in manifest:
         return needle
@@ -552,7 +575,7 @@ def status(client, root, todas):
         local = mirror.bodies.get(moved_to if moved else entry["path"])
 
         mine = moved or changed(local, base, page.body if page else None)
-        theirs = advanced(page, entry, base)
+        theirs = advanced_by_body(page, entry, base)
 
         etiqueta = f"wiki/{moved_to} (movida desde {entry['path']})" if moved else f"wiki/{entry['path']}"
         if page is None:
@@ -592,6 +615,8 @@ def status(client, root, todas):
         f"{len(adelantadas)} con la remota adelantada y {len(conflictos)} en conflicto "
         f"en {scope.label()}"
     )
+    if conflictos:
+        print("los dos lados de un conflicto se ven con 'outline diff'")
     if missing:
         titles = ", ".join(node["title"] for node in missing)
         print(f"aviso: sin contenido accesible para {len(missing)}: {titles}")
@@ -601,12 +626,12 @@ def status(client, root, todas):
 def check(client, root, needles):
     manifest = load_manifest(root)
     targets = (
-        [resolve(root, manifest, needle) for needle in needles] if needles else list(manifest)
+        [find_page(root, manifest, needle) for needle in needles] if needles else list(manifest)
     )
     stale = 0
     for document_id in targets:
         local = manifest[document_id]
-        remote = (client.post("documents.info", {"id": document_id}) or {}).get("data") or {}
+        remote = fetch_document(client, document_id) or {}
         if remote.get("revision") != local["revision"]:
             print(
                 f"DESACTUALIZADO {title_of(root, local)}: local rev {local['revision']}, "
@@ -620,18 +645,371 @@ def check(client, root, needles):
     return 0
 
 
+def split_title(body):
+    """El título y el cuerpo que van a la API, con el encabezado de nivel 1 ya fuera."""
+    body = body.lstrip("\n")
+    first, _, rest = body.partition("\n")
+    if first.startswith("# "):
+        return first[2:].strip(), rest.strip("\n")
+    return None, body.strip("\n")
+
+
+def refuse_duplicates(identities):
+    """Dos ficheros con la misma identidad son una copia a la que no le quitaron el id."""
+    repeated = {}
+    for relative in sorted(identities):
+        if identities[relative] is None:
+            continue
+        repeated.setdefault(identities[relative], []).append(f"wiki/{relative}")
+    conflicting = {i: paths for i, paths in repeated.items() if len(paths) > 1}
+    if not conflicting:
+        return
+    detail = "\n".join(
+        f"  {i}\n" + "\n".join(f"    {path}" for path in paths)
+        for i, paths in conflicting.items()
+    )
+    fail(
+        "hay páginas que comparten identidad y no se puede saber cuál manda, "
+        f"así que no se sube nada:\n{detail}\n"
+        "quita el outline_id del frontmatter de la copia, o sácala de la ruta que el "
+        "manifiesto ya da por ocupada, para que el push la cree aparte."
+    )
+
+
+def collection_for(relative, scope):
+    """La colección que le toca a un fichero por su ruta, o None si la ruta no lo dice."""
+    if not scope.prefixed:
+        return scope.collections[0]
+    head, _, rest = relative.partition("/")
+    if not rest:
+        return None
+    return next((c for c in scope.collections if slugify(c["name"]) == head), None)
+
+
+def parent_path(relative, scope):
+    """La ruta de la página de la que cuelga un fichero, o None si cuelga de la colección."""
+    parts = relative.split("/")
+    if len(parts) == (2 if scope.prefixed else 1):
+        return None
+    return "/".join(parts[:-1]) + ".md"
+
+
+def level_size(relative, mirror):
+    """Cuántas páginas hay en el nivel de un fichero, contándolo a él."""
+    folder = relative.rpartition("/")[0]
+    return sum(1 for other in mirror.bodies if other.rpartition("/")[0] == folder)
+
+
+def advanced_by_revision(remote, entry, base, remote_body):
+    """Si Outline se movió, mirando la revisión que devuelve la página recién pedida."""
+    if entry.get("revision") is None:
+        return remote_body != base
+    return remote.get("revision") != entry["revision"]
+
+
+def remember(root, manifest, relative, document, collection):
+    """Da la página por sincronizada, con la base en lo que Outline acaba de devolver."""
+    write(
+        root / STATE_DIR / "base" / relative,
+        page_body(document["title"], document.get("text")),
+    )
+    manifest[document["id"]] = {
+        "path": relative,
+        "revision": document.get("revision"),
+        "collection": collection["name"],
+        "collectionId": collection["id"],
+    }
+
+
+@dataclass
+class Pusher:
+    """Una pasada de push: de dónde lee, contra qué compara y qué lleva hecho."""
+
+    client: object
+    root: Path
+    mirror: Mirror
+    shadowed: dict
+    scope: Scope
+    manifest: dict
+    pages_by_path: dict
+    uploaded: list = field(default_factory=list)
+    created: list = field(default_factory=list)
+    clashed: list = field(default_factory=list)
+    unsure: list = field(default_factory=list)
+    rejected: list = field(default_factory=list)
+    settled: int = 0
+
+    def update(self, relative, document_id, entry):
+        """Sube una página que Outline ya conoce, si nadie se ha adelantado."""
+        local = self.mirror.bodies[relative]
+        base = self.shadowed.get(entry["path"] if entry else relative)
+        if local == base:
+            return
+        remote = fetch_document(self.client, document_id)
+        if remote is None:
+            self.unsure.append(f"wiki/{relative}, sin contenido accesible en Outline")
+            return
+        collection = self.scope.by_id(remote.get("collectionId"))
+        if collection is None:
+            self.unsure.append(
+                f"wiki/{relative}, en una colección fuera de {self.scope.label()}"
+            )
+            return
+        remote_body = page_body(remote["title"], remote.get("text"))
+        if local == remote_body:
+            remember(self.root, self.manifest, relative, remote, collection)
+            self.settled += 1
+            return
+        if entry is None or base is None:
+            self.unsure.append(
+                f"wiki/{relative}, sin base con la que comparar. "
+                "Acepta el estado de Outline con 'outline resolve' y vuelve a intentarlo"
+            )
+            return
+        if advanced_by_revision(remote, entry, base, remote_body):
+            self.clashed.append(f"wiki/{relative}")
+            return
+        title, body = split_title(local)
+        payload = {"id": document_id, "text": body}
+        if title:
+            payload["title"] = title
+        document = (self.client.post("documents.update", payload) or {}).get("data")
+        if document is None:
+            self.unsure.append(f"wiki/{relative}, sin respuesta de Outline al escribirla")
+            return
+        remember(self.root, self.manifest, relative, document, collection)
+        self.uploaded.append(f"wiki/{relative}")
+
+    def create(self, relative):
+        """Crea en Outline una página que hasta ahora solo existía en el disco."""
+        title, body = split_title(self.mirror.bodies[relative])
+        collection = collection_for(relative, self.scope)
+        parent = parent_path(relative, self.scope)
+        if title is None:
+            self.rejected.append(
+                f"wiki/{relative}, sin el encabezado de nivel 1 que da el título"
+            )
+            return
+        if collection is None:
+            self.rejected.append(f"wiki/{relative}, fuera de ninguna colección")
+            return
+        if parent is not None and parent not in self.pages_by_path:
+            self.rejected.append(
+                f"wiki/{relative}, que cuelga de wiki/{parent} y esa página no existe"
+            )
+            return
+        payload = {
+            "title": title,
+            "text": body,
+            "collectionId": collection["id"],
+            "publish": True,
+        }
+        if parent:
+            payload["parentDocumentId"] = self.pages_by_path[parent]
+        document = (self.client.post("documents.create", payload) or {}).get("data")
+        if document is None:
+            self.rejected.append(f"wiki/{relative}, sin respuesta de Outline al crearla")
+            return
+        document = self.place_last(document, relative, collection, parent)
+        self.pages_by_path[relative] = document["id"]
+        write(
+            self.root / "wiki" / relative,
+            frontmatter(document["id"]) + self.mirror.bodies[relative],
+        )
+        remember(self.root, self.manifest, relative, document, collection)
+        self.created.append(f"wiki/{relative}")
+
+    def place_last(self, document, relative, collection, parent):
+        """Outline la cuelga al principio del nivel, y moverla al final sube su revisión."""
+        movimiento = {
+            "id": document["id"],
+            "collectionId": collection["id"],
+            "index": level_size(relative, self.mirror),
+        }
+        if parent:
+            movimiento["parentDocumentId"] = self.pages_by_path[parent]
+        answer = (self.client.post("documents.move", movimiento) or {}).get("data") or {}
+        moved = next(
+            (d for d in answer.get("documents", []) if d["id"] == document["id"]), None
+        )
+        return moved or document
+
+    def tell(self):
+        """Cuenta cómo fue la pasada y devuelve el código de salida."""
+        partes = []
+        if self.uploaded:
+            partes.append(plural(len(self.uploaded), "página subida", "páginas subidas"))
+        if self.created:
+            partes.append(plural(len(self.created), "creada", "creadas"))
+        if self.settled:
+            partes.append(plural(self.settled, "ya estaba en Outline", "ya estaban en Outline"))
+        if self.clashed:
+            partes.append(f"{len(self.clashed)} en conflicto")
+        if self.unsure:
+            partes.append(f"{len(self.unsure)} sin comparar")
+        if self.rejected:
+            partes.append(f"{len(self.rejected)} sin crear")
+        print(f"{', '.join(partes) or 'nada que subir'} en {self.scope.label()}")
+        section("subidas", self.uploaded)
+        section("creadas", self.created)
+        section("en conflicto, la remota se adelantó desde el último pull", self.clashed)
+        section("sin comparar, así que no se han tocado", self.unsure)
+        section("sin crear, porque la ruta o el fichero no dicen dónde va", self.rejected)
+        if self.clashed:
+            print(
+                "mira los dos diffs con 'outline diff', deja el fichero como quieras "
+                "y márcalo con 'outline resolve'."
+            )
+        return 1 if self.clashed or self.unsure or self.rejected else 0
+
+
+def push(client, root, todas):
+    wiki = root / "wiki"
+    state = load_state(root)
+    manifest = state["documents"]
+    mirror = Mirror.read(wiki)
+    by_path = {entry["path"]: document_id for document_id, entry in manifest.items()}
+    identity_of = {
+        relative: mirror.ids.get(relative) or by_path.get(relative)
+        for relative in mirror.bodies
+    }
+    refuse_duplicates(identity_of)
+
+    if not state.get("pullComplete", False):
+        print(
+            "aviso: el último pull no terminó del todo, así que la base puede estar a medias. "
+            "Pasa un 'outline pull' antes de fiarte de lo que salga aquí."
+        )
+        print()
+
+    scope = Scope.only_collections(client, root, todas)
+    pusher = Pusher(
+        client=client,
+        root=root,
+        mirror=mirror,
+        shadowed=shadow(root / STATE_DIR / "base"),
+        scope=scope,
+        manifest=manifest,
+        pages_by_path={**by_path, **mirror.ids},
+    )
+
+    newborn = []
+    for relative in sorted(mirror.bodies):
+        document_id = identity_of[relative]
+        if document_id is None:
+            newborn.append(relative)
+            continue
+        entry = manifest.get(document_id)
+        if entry is None or scope.covers(entry):
+            pusher.update(relative, document_id, entry)
+
+    # De fuera hacia dentro, para que una hija encuentre a su madre recién creada.
+    newborn.sort(key=lambda relative: (relative.count("/"), relative))
+    for relative in newborn:
+        pusher.create(relative)
+
+    write_manifest(root, manifest, complete=state.get("pullComplete", False))
+    return pusher.tell()
+
+
+def show_diff(heading, base, other, name):
+    print(heading)
+    body = "".join(
+        difflib.unified_diff(
+            (base or "").splitlines(True),
+            (other or "").splitlines(True),
+            "base",
+            name,
+        )
+    )
+    print(body.rstrip("\n") if body else "  sin cambios")
+    print()
+
+
+def diff(client, root, needles):
+    manifest = load_manifest(root)
+    mirror = Mirror.read(root / "wiki")
+    shadowed = shadow(root / STATE_DIR / "base")
+
+    if needles:
+        targets = [find_page(root, manifest, needle) for needle in needles]
+    else:
+        targets = [
+            document_id
+            for document_id, entry in manifest.items()
+            if mirror.bodies.get(entry["path"]) not in (None, shadowed.get(entry["path"]))
+        ]
+
+    shown = 0
+    for document_id in targets:
+        entry = manifest[document_id]
+        local = mirror.bodies.get(entry["path"])
+        base = shadowed.get(entry["path"])
+        remote = fetch_document(client, document_id)
+        remote_body = page_body(remote["title"], remote.get("text")) if remote else None
+        theirs = (
+            remote is None
+            or base is None
+            or advanced_by_revision(remote, entry, base, remote_body)
+        )
+        if not needles and not (local != base and theirs):
+            continue
+        shown += 1
+        print(f"wiki/{entry['path']}\n")
+        show_diff("base -> local, lo que has escrito tú", base, local, "local")
+        show_diff("base -> remoto, lo que hay en Outline", base, remote_body, "remoto")
+    if not needles and not shown:
+        print("sin conflictos")
+    return 0
+
+
+def resolve(client, root, needles):
+    """Da un conflicto por resuelto adelantando la base al remoto de ahora mismo."""
+    if not needles:
+        fail(
+            "dime qué página doy por resuelta, por id, ruta o título. "
+            "Las que están en conflicto salen en 'outline status'."
+        )
+    state = load_state(root)
+    manifest = state["documents"]
+    mirror = Mirror.read(root / "wiki")
+    known = {**{i: {"path": r, "revision": None} for r, i in mirror.ids.items()}, **manifest}
+
+    for needle in needles:
+        document_id = find_page(root, known, needle)
+        entry = dict(known[document_id])
+        remote = fetch_document(client, document_id)
+        if remote is None:
+            fail(f"Outline no devuelve contenido para wiki/{entry['path']}")
+        write(
+            root / STATE_DIR / "base" / entry["path"],
+            page_body(remote["title"], remote.get("text")),
+        )
+        entry["revision"] = remote.get("revision")
+        entry.setdefault("collectionId", remote.get("collectionId"))
+        manifest[document_id] = entry
+        print(
+            f"wiki/{entry['path']}: la base pasa a la revisión {remote.get('revision')} "
+            "de Outline. Lo que tengas en local se sube con 'outline push'."
+        )
+    write_manifest(root, manifest, complete=state.get("pullComplete", False))
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="outline", description="Espejo local de una wiki de Outline"
     )
     parser.add_argument(
-        "command", nargs="?", default="pull", choices=["pull", "status", "check"],
-        help="pull baja la wiki, status dice en qué estado estás, "
+        "command", nargs="?", default="pull",
+        choices=["pull", "push", "status", "diff", "resolve", "check"],
+        help="pull baja la wiki, push sube lo que has escrito, status dice en qué estado "
+             "estás, diff enseña los dos lados de un conflicto, resolve lo da por resuelto, "
              "check compara revisiones sin escribir nada",
     )
     parser.add_argument(
         "targets", nargs="*",
-        help="páginas a comprobar con check, por id, ruta o título. Por defecto todas",
+        help="páginas para check, diff o resolve, por id, ruta o título",
     )
     parser.add_argument(
         "--all", dest="todas", action="store_true",
@@ -646,6 +1024,12 @@ def main(argv=None):
         return check(client, root, arguments.targets)
     if arguments.command == "status":
         return status(client, root, arguments.todas)
+    if arguments.command == "push":
+        return push(client, root, arguments.todas)
+    if arguments.command == "diff":
+        return diff(client, root, arguments.targets)
+    if arguments.command == "resolve":
+        return resolve(client, root, arguments.targets)
     return pull(client, root, arguments.todas)
 
 

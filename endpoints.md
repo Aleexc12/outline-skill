@@ -51,7 +51,16 @@ Para buscar solo en la copia local, `grep` sobre `wiki/` es gratis y suele basta
 | `index` | posición dentro del nivel |
 
 Hay que pasar al menos `collectionId` o `parentDocumentId`.
-Devuelve los documentos y colecciones afectados, que es una respuesta grande: filtrar con `jq`.
+Devuelve los documentos y colecciones afectados, que es una respuesta grande, así que
+conviene filtrarla con `jq`.
+El documento que devuelve ya trae la revisión de después del movimiento.
+
+Tres cosas comprobadas contra la instancia el 2026-09-07, porque el `push` depende de ellas.
+`documents.create` no acepta posición, y Outline cuelga la página nueva **al principio** de su
+nivel, no al final.
+Un `index` mayor que el número de hermanos no falla, se recorta y la deja la última.
+Mover sube la revisión del documento aunque el texto no cambie, así que quien mueva algo tiene
+que quedarse con la revisión que devuelve el movimiento, no con la de antes.
 
 ## Borrar y archivar
 
