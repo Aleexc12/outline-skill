@@ -544,35 +544,48 @@ def load_manifest(root):
     return load_state(root)["documents"]
 
 
-def title_of(root, entry):
+def title_of(root, relative):
     """El encabezado de nivel 1 de la página, o su ruta si falta o no lo lleva."""
-    path = root / "wiki" / entry["path"]
+    path = root / "wiki" / relative
     if path.is_file():
         body = strip_frontmatter(path.read_text(encoding="utf-8")).lstrip("\n")
         primera = body.split("\n", 1)[0]
         if primera.startswith("# "):
             return primera[2:].strip()
-    return entry["path"]
+    return relative
 
 
-def find_page(root, manifest, needle):
+def located(mirror, manifest):
+    """Dónde está hoy el fichero de cada página, que no siempre es lo que dice el manifiesto.
+
+    Manda el frontmatter: una página que has arrastrado a otra carpeta vive donde la dejaste,
+    y el manifiesto no se entera hasta el `push`.
+    """
+    return {
+        **{document_id: entry["path"] for document_id, entry in manifest.items()},
+        **{document_id: relative for relative, document_id in mirror.ids.items()},
+    }
+
+
+def find_page(root, manifest, needle, at):
     """Acepta un id exacto, una ruta dentro de wiki/ o un trozo del título."""
     if needle in manifest:
         return needle
     lowered = needle.lower().replace("\\", "/").removeprefix("wiki/")
-    matches = [
-        document_id
-        for document_id, entry in manifest.items()
-        if lowered in (entry["path"].lower(), Path(entry["path"]).stem.lower())
-        or lowered in title_of(root, entry).lower()
-    ]
+
+    def hits(document_id):
+        relative = at[document_id]
+        names = (relative.lower(), Path(relative).stem.lower())
+        return lowered in names or lowered in title_of(root, relative).lower()
+
+    matches = [document_id for document_id in manifest if hits(document_id)]
     if not matches:
         fail(
             f"'{needle}' no coincide con ninguna página. "
             f"Las páginas están en {STATE_DIR}/index.md"
         )
     if len(matches) > 1:
-        options = "\n".join(f"  {i} {title_of(root, manifest[i])}" for i in matches)
+        options = "\n".join(f"  {i} {title_of(root, at[i])}" for i in matches)
         fail(f"'{needle}' coincide con {len(matches)} páginas:\n{options}")
     return matches[0]
 
@@ -589,7 +602,7 @@ def status(client, root, todas):
     remote = {page.id: page for page in pages}
     unreadable = {node["id"] for node in missing}
     tracked = {entry["path"] for entry in manifest.values()}
-    located = {document_id: relative for relative, document_id in mirror.ids.items()}
+    lives = located(mirror, manifest)
 
     limpias, sucias, adelantadas, conflictos = 0, [], [], []
     for document_id, entry in manifest.items():
@@ -597,11 +610,11 @@ def status(client, root, todas):
             continue
         page = remote.get(document_id)
         base = shadowed.get(entry["path"])
-        moved_to = located.get(document_id)
-        moved = moved_to is not None and moved_to != entry["path"]
+        moved_to = lives[document_id]
+        moved = moved_to != entry["path"]
         if moved:
             tracked.add(moved_to)
-        local = mirror.bodies.get(moved_to if moved else entry["path"])
+        local = mirror.bodies.get(moved_to)
 
         mine = moved or changed(local, base, page.body if page else None)
         theirs = advanced_by_body(page, entry, base)
@@ -654,8 +667,11 @@ def status(client, root, todas):
 
 def check(client, root, needles):
     manifest = load_manifest(root)
+    lives = located(Mirror.read(root / "wiki"), manifest)
     targets = (
-        [find_page(root, manifest, needle) for needle in needles] if needles else list(manifest)
+        [find_page(root, manifest, needle, lives) for needle in needles]
+        if needles
+        else list(manifest)
     )
     stale = 0
     for document_id in targets:
@@ -663,8 +679,8 @@ def check(client, root, needles):
         remote = fetch_document(client, document_id) or {}
         if remote.get("revision") != local["revision"]:
             print(
-                f"DESACTUALIZADO {title_of(root, local)}: local rev {local['revision']}, "
-                f"remoto rev {remote.get('revision')}"
+                f"DESACTUALIZADO {title_of(root, lives[document_id])}: "
+                f"local rev {local['revision']}, remoto rev {remote.get('revision')}"
             )
             stale += 1
     if stale:
@@ -914,7 +930,18 @@ class Pusher:
         parent = parent_path(relative, self.scope)
         return collection, parent, (self.pages_by_path.get(parent) if parent else None)
 
-    def relocate(self, relative, document_id, was_at):
+    def relocate_all(self, movable):
+        """Reanida en Outline los ficheros que cambiaron de carpeta.
+
+        Las bases se leen todas antes de escribir ninguna, porque dos ficheros que
+        intercambian sus rutas se pisarían la base el uno al otro.
+        """
+        bases = shadow(self.root / STATE_DIR / "base")
+        for relative, document_id, was_at in movable:
+            if self.relocate(relative, document_id, was_at, bases):
+                self.settle_path(document_id, relative, was_at, bases)
+
+    def relocate(self, relative, document_id, was_at, bases):
         """Reanida en Outline una página cuyo fichero cambió de carpeta.
 
         Devuelve si la ruta nueva se puede dar por buena, que es lo que deja apuntarla.
@@ -939,7 +966,7 @@ class Pusher:
             self.unmoved.append(f"wiki/{relative}, sin contenido accesible en Outline")
             return False
         remote_body = page_body(remote["title"], remote.get("text"))
-        overtaken = advanced_by_revision(remote, entry, self.base_of(was_at), remote_body)
+        overtaken = advanced_by_revision(remote, entry, bases.get(was_at), remote_body)
         payload = {
             "id": document_id,
             "collectionId": collection["id"],
@@ -965,16 +992,11 @@ class Pusher:
         destino.append(f"wiki/{relative}, desde wiki/{was_at}")
         return True
 
-    def base_of(self, relative):
-        """El cuerpo de la base como está ahora en el disco, no como estaba al empezar."""
-        path = self.root / STATE_DIR / "base" / relative
-        return path.read_text(encoding="utf-8") if path.is_file() else None
-
-    def settle_path(self, document_id, relative, was_at):
+    def settle_path(self, document_id, relative, was_at, bases):
         """Muda la base con el fichero y apunta en el manifiesto dónde vive ahora."""
         if was_at == relative:
             return
-        base = self.base_of(was_at)
+        base = bases.get(was_at)
         if base is not None:
             write(self.root / STATE_DIR / "base" / relative, base)
             if was_at not in self.mirror.bodies:
@@ -1050,10 +1072,18 @@ def push(client, root, todas, confirmed=False):
     manifest = state["documents"]
     mirror = Mirror.read(wiki)
     by_path = {entry["path"]: document_id for document_id, entry in manifest.items()}
-    identity_of = {
-        relative: mirror.ids.get(relative) or by_path.get(relative)
-        for relative in mirror.bodies
-    }
+    claimed = set(mirror.ids.values())
+
+    def identity(relative):
+        """De quién es un fichero: de su frontmatter, o de quien el manifiesto puso en su ruta.
+
+        Una ruta cuya página se mudó ya no presta identidad, porque la reclama el frontmatter
+        de otro fichero. Lo que ocupa el hueco es una página nueva.
+        """
+        inherited = by_path.get(relative)
+        return mirror.ids.get(relative) or (None if inherited in claimed else inherited)
+
+    identity_of = {relative: identity(relative) for relative in mirror.bodies}
     refuse_duplicates(identity_of)
 
     if not complete:
@@ -1101,9 +1131,7 @@ def push(client, root, todas, confirmed=False):
         pusher.create(relative)
 
     # Después de crear, para que una página pueda mudarse debajo de otra recién nacida.
-    for relative, document_id, was_at in movable:
-        if pusher.relocate(relative, document_id, was_at):
-            pusher.settle_path(document_id, relative, was_at)
+    pusher.relocate_all(movable)
 
     pusher.remove(doomed, confirmed, complete)
     write_manifest(root, manifest, complete=complete)
@@ -1128,27 +1156,22 @@ def diff(client, root, needles):
     manifest = load_manifest(root)
     mirror = Mirror.read(root / "wiki")
     shadowed = shadow(root / STATE_DIR / "base")
-    # Una página que has arrastrado a otra carpeta sigue siendo la misma, así que el diff
-    # la busca por identidad antes que por la ruta que el manifiesto todavía tiene.
-    located = {document_id: relative for relative, document_id in mirror.ids.items()}
-
-    def lives_at(document_id):
-        return located.get(document_id, manifest[document_id]["path"])
+    lives = located(mirror, manifest)
 
     if needles:
-        targets = [find_page(root, manifest, needle) for needle in needles]
+        targets = [find_page(root, manifest, needle, lives) for needle in needles]
     else:
         targets = [
             document_id
             for document_id, entry in manifest.items()
-            if mirror.bodies.get(lives_at(document_id))
+            if mirror.bodies.get(lives[document_id])
             not in (None, shadowed.get(entry["path"]))
         ]
 
     shown = 0
     for document_id in targets:
         entry = manifest[document_id]
-        local = mirror.bodies.get(lives_at(document_id))
+        local = mirror.bodies.get(lives[document_id])
         base = shadowed.get(entry["path"])
         remote = fetch_document(client, document_id)
         remote_body = page_body(remote["title"], remote.get("text")) if remote else None
@@ -1160,7 +1183,7 @@ def diff(client, root, needles):
         if not needles and not (local != base and theirs):
             continue
         shown += 1
-        print(f"wiki/{lives_at(document_id)}\n")
+        print(f"wiki/{lives[document_id]}\n")
         show_diff("base -> local, lo que has escrito tú", base, local, "local")
         show_diff("base -> remoto, lo que hay en Outline", base, remote_body, "remoto")
     if not needles and not shown:
@@ -1179,13 +1202,15 @@ def resolve(client, root, needles):
     manifest = state["documents"]
     mirror = Mirror.read(root / "wiki")
     known = {**{i: {"path": r, "revision": None} for r, i in mirror.ids.items()}, **manifest}
+    lives = located(mirror, known)
 
     for needle in needles:
-        document_id = find_page(root, known, needle)
+        document_id = find_page(root, known, needle, lives)
         entry = dict(known[document_id])
         remote = fetch_document(client, document_id)
         if remote is None:
-            fail(f"Outline no devuelve contenido para wiki/{entry['path']}")
+            fail(f"Outline no devuelve contenido para wiki/{lives[document_id]}")
+        # La base va a la ruta del manifiesto, que es contra la que compara el push.
         write(
             root / STATE_DIR / "base" / entry["path"],
             page_body(remote["title"], remote.get("text")),
@@ -1194,7 +1219,7 @@ def resolve(client, root, needles):
         entry.setdefault("collectionId", remote.get("collectionId"))
         manifest[document_id] = entry
         print(
-            f"wiki/{entry['path']}: la base pasa a la revisión {remote.get('revision')} "
+            f"wiki/{lives[document_id]}: la base pasa a la revisión {remote.get('revision')} "
             "de Outline. Lo que tengas en local se sube con 'outline push'."
         )
     write_manifest(root, manifest, complete=state.get("pullComplete", False))

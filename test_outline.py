@@ -590,6 +590,16 @@ class Check(Caso):
 
         self.assertEqual(self.ejecutar("check", "Diagnóstico"), 1)
 
+    def test_una_pagina_movida_se_comprueba_por_su_titulo(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        self.transporte.documentos[self.identificador(raiz, "albaran.md")]["revision"] = 2
+        self.mover_fichero(raiz, "albaran.md", "diagnostico/albaran.md")
+
+        salida = self.salida("check", "Albarán")
+
+        self.assertIn("DESACTUALIZADO Albarán", salida)
+
     def test_sin_manifiesto_pide_un_pull(self):
         self.proyecto("Taller")
 
@@ -1227,19 +1237,21 @@ class Push(Caso):
         self.assertIn("wiki/copia-del-diagnostico.md", mensaje)
         self.assertEqual(self.transporte.escrituras(), [])
 
-    def test_dos_ficheros_con_la_misma_identidad_abortan_aunque_una_pierda_el_frontmatter(self):
+    def test_el_frontmatter_manda_sobre_la_ruta_que_el_manifiesto_recuerda(self):
         raiz = self.preparar()
         original = self.pagina(raiz, "diagnostico.md")
+        diagnostico = self.identificador(raiz, "diagnostico.md")
         self.crear_local(raiz, "copia-del-diagnostico.md", original)
         (raiz / "wiki" / "diagnostico.md").write_text(
             outline.strip_frontmatter(original), encoding="utf-8"
         )
 
-        mensaje = self.ejecutar_fallando("push")
+        self.ejecutar("push")
 
-        self.assertIn("wiki/diagnostico.md", mensaje)
-        self.assertIn("wiki/copia-del-diagnostico.md", mensaje)
-        self.assertEqual(self.transporte.escrituras(), [])
+        documentos = self.estado(raiz)["documents"]
+        self.assertEqual(documentos[diagnostico]["path"], "copia-del-diagnostico.md")
+        self.assertNotEqual(self.identificador(raiz, "diagnostico.md"), diagnostico)
+        self.assertEqual(self.transporte.papelera, [])
 
     def test_un_cuerpo_que_empieza_por_tres_guiones_no_se_pierde_al_subir(self):
         raiz = self.preparar()
@@ -1646,6 +1658,33 @@ class PushMueve(Caso):
         self.assertIn("wiki/chapa.md", salida)
         self.assertEqual(self.estado(raiz)["documents"][albaran]["path"], "albaran.md")
 
+    def test_dos_ficheros_que_intercambian_sus_rutas_no_se_pisan_la_base(self):
+        raiz = self.preparar()
+        wiki = raiz / "wiki"
+        (wiki / "albaran.md").rename(wiki / "en-transito.md")
+        (wiki / "diagnostico.md").rename(wiki / "albaran.md")
+        (wiki / "en-transito.md").rename(wiki / "diagnostico.md")
+
+        self.ejecutar("push")
+
+        self.assertIn("Cuerpo del diagnóstico.", self.base(raiz, "albaran.md"))
+        self.assertIn("Cuerpo del albarán.", self.base(raiz, "diagnostico.md"))
+        self.assertEqual(self.salida("status").count("sucia"), 1)
+
+    def test_crear_una_pagina_en_el_hueco_que_deja_la_que_se_muda(self):
+        raiz = self.preparar()
+        albaran = self.identificador(raiz, "albaran.md")
+        diagnostico = self.identificador(raiz, "diagnostico.md")
+        self.mover_fichero(raiz, "albaran.md", "diagnostico/albaran.md")
+        self.crear_local(raiz, "albaran.md", "# Albaranes de 2026\n\nLos de este año.\n")
+
+        self.ejecutar("push")
+
+        self.assertEqual(self.transporte.documentos[albaran]["parentDocumentId"], diagnostico)
+        nuevo = self.identificador_remoto("Albaranes de 2026")
+        self.assertIsNone(self.transporte.documentos[nuevo]["parentDocumentId"])
+        self.assertEqual(self.transporte.papelera, [])
+
     def test_un_fichero_en_una_carpeta_que_no_es_ninguna_coleccion_no_se_mueve(self):
         raiz = self.proyecto("Cualquiera")
         self.ejecutar("pull", "--all")
@@ -1975,6 +2014,15 @@ class Diff(Caso):
         self.assertIn("wiki/albaran.md", salida)
         self.assertNotIn("diagnostico.md", salida)
 
+    def test_una_pagina_movida_tambien_se_puede_pedir_por_su_titulo(self):
+        raiz = self.montar_conflicto()
+        self.mover_fichero(raiz, "diagnostico.md", "albaran/diagnostico.md")
+
+        salida = self.salida("diff", "Diagnóstico")
+
+        self.assertIn("wiki/albaran/diagnostico.md", salida)
+        self.assertIn("+Lo que escribí yo.", salida)
+
 
 class Resolver(Caso):
     def test_marcar_resuelto_adelanta_la_base_al_remoto(self):
@@ -2005,6 +2053,28 @@ class Resolver(Caso):
         texto = self.transporte.documentos[identificador]["text"]
         self.assertIn("Lo que escribí yo.", texto)
         self.assertNotIn("Lo que escribió mi socia.", texto)
+
+    def test_una_pagina_movida_se_resuelve_por_su_titulo_y_dice_donde_esta(self):
+        raiz = self.montar_conflicto()
+        self.mover_fichero(raiz, "diagnostico.md", "albaran/diagnostico.md")
+
+        salida = self.salida("resolve", "Diagnóstico")
+
+        self.assertIn("wiki/albaran/diagnostico.md", salida)
+        # La base se queda en la ruta vieja, que es contra la que compara el push siguiente.
+        self.assertIn("Lo que escribió mi socia.", self.base(raiz, "diagnostico.md"))
+
+    def test_resuelta_asi_el_push_sube_mi_version_y_ademas_la_mueve(self):
+        raiz = self.montar_conflicto()
+        albaran = self.identificador(raiz, "albaran.md")
+        self.mover_fichero(raiz, "diagnostico.md", "albaran/diagnostico.md")
+
+        self.ejecutar("resolve", "Diagnóstico")
+        self.ejecutar("push")
+
+        diagnostico = self.identificador(raiz, "albaran/diagnostico.md")
+        self.assertIn("Lo que escribí yo.", self.transporte.documentos[diagnostico]["text"])
+        self.assertEqual(self.transporte.documentos[diagnostico]["parentDocumentId"], albaran)
 
     def test_sin_decir_que_pagina_falla(self):
         self.montar_conflicto()
