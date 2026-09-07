@@ -47,6 +47,7 @@ class Transporte:
         self.inaccesibles = set()
         self.papelera = []
         self.destruidos = []
+        self.mudos = set()
         self.creados = 0
         for indice, (nombre, nodos) in enumerate(arbol.items(), start=1):
             coleccion = f"col-{indice}"
@@ -135,6 +136,8 @@ class Transporte:
             documento["collectionId"] = coleccion
             documento["parentDocumentId"] = padre
             documento["revision"] += 1
+            if payload["id"] in self.mudos:
+                return {"data": {"documents": [], "collections": []}}
             return {"data": {"documents": [dict(documento)], "collections": []}}
         if endpoint == "documents.delete":
             documento = self.documentos[payload["id"]]
@@ -323,7 +326,7 @@ class Caso(unittest.TestCase):
         return next(d["id"] for d in self.transporte.documentos.values() if d["title"] == titulo)
 
     def mover_fichero(self, raiz, origen, destino):
-        """Arrastra la página a otra carpeta, como quien reorganiza la wiki."""
+        """Arrastra el fichero de la página a otra carpeta, sin tocar lo que hay dentro."""
         salida = raiz / "wiki" / destino
         salida.parent.mkdir(parents=True, exist_ok=True)
         (raiz / "wiki" / origen).rename(salida)
@@ -1531,6 +1534,54 @@ class PushMueve(Caso):
         entradas = self.estado(raiz)["documents"]
         self.assertEqual(entradas[auditoria]["path"], "albaran/diagnostico/auditoria-de-ruido.md")
 
+    def test_un_movimiento_que_outline_no_confirma_no_se_da_por_bueno(self):
+        raiz = self.preparar()
+        albaran = self.identificador(raiz, "albaran.md")
+        self.transporte.mudos.add(albaran)
+        self.mover_fichero(raiz, "albaran.md", "diagnostico/albaran.md")
+
+        salida = self.salida("push")
+
+        self.assertIn("sin mover", salida)
+        self.assertEqual(self.estado(raiz)["documents"][albaran]["path"], "albaran.md")
+
+    def adelantar(self, raiz):
+        """Mi socia edita en Outline la página que voy a mover, entre mi pull y mi push."""
+        albaran = self.identificador(raiz, "albaran.md")
+        self.transporte.editar(albaran, "Lo que escribió mi socia.")
+        self.mover_fichero(raiz, "albaran.md", "diagnostico/albaran.md")
+        return albaran
+
+    def test_mover_con_outline_adelantado_no_apunta_la_revision_del_movimiento(self):
+        raiz = self.preparar()
+        albaran = self.adelantar(raiz)
+
+        salida = self.salida("push")
+
+        self.assertIn("adelantada", salida)
+        apuntada = self.estado(raiz)["documents"][albaran]["revision"]
+        self.assertNotEqual(apuntada, self.transporte.documentos[albaran]["revision"])
+
+    def test_movida_asi_el_pull_siguiente_trae_el_texto_de_mi_socia(self):
+        raiz = self.preparar()
+        self.adelantar(raiz)
+        self.ejecutar("push")
+
+        self.ejecutar("pull")
+
+        self.assertIn("Lo que escribió mi socia.", self.pagina(raiz, "diagnostico/albaran.md"))
+
+    def test_movida_asi_una_edicion_mia_encima_se_rebota_como_conflicto(self):
+        raiz = self.preparar()
+        albaran = self.adelantar(raiz)
+        self.ejecutar("push")
+        self.editar_local(raiz, "diagnostico/albaran.md", "Lo que escribí yo.")
+
+        salida = self.salida("push")
+
+        self.assertIn("en conflicto", salida)
+        self.assertNotIn("Lo que escribí yo.", self.transporte.documentos[albaran]["text"])
+
     def test_una_pagina_en_conflicto_no_se_mueve(self):
         raiz = self.preparar()
         albaran = self.identificador(raiz, "albaran.md")
@@ -1718,6 +1769,23 @@ class PushBorra(Caso):
         self.assertIn(albaran, self.estado(raiz)["documents"])
         self.assertIn("sin borrar", salida)
 
+    def test_con_yes_tambien_lista_las_paginas_antes_de_borrarlas(self):
+        raiz = self.preparar()
+        (raiz / "wiki" / "albaran.md").unlink()
+
+        salida = self.salida("push", "--yes")
+
+        self.assertIn("ya no están en el disco", salida)
+        self.assertIn("wiki/albaran.md", salida)
+
+    def test_contestar_que_no_es_una_decision_tuya_y_no_un_fallo(self):
+        raiz = self.preparar()
+        (raiz / "wiki" / "albaran.md").unlink()
+        self.teclear("no")
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(outline.main(["push"]), 0)
+
     def test_sin_nadie_al_teclado_no_borra_y_dice_como_confirmar(self):
         raiz = self.preparar()
         (raiz / "wiki" / "albaran.md").unlink()
@@ -1775,7 +1843,7 @@ class PushBorra(Caso):
         self.assertIn(inventario, self.estado(raiz)["documents"])
 
     def test_una_pagina_creada_en_remoto_despues_del_pull_no_se_borra(self):
-        raiz = self.preparar()
+        self.preparar()
         ajena = self.transporte.crear("Presupuesto", "Lo que cuesta.")
 
         self.ejecutar("push", "--yes")
@@ -1805,8 +1873,8 @@ class PushBorra(Caso):
             [("documents.delete", {"id": diagnostico, "permanent": False})],
         )
         self.assertEqual(self.transporte.papelera, [diagnostico, auditoria])
-        entradas = self.estado(raiz)['''documents''']
-        self.assertEqual(list(entradas), [self.identificador(raiz, '''albaran.md''')])
+        entradas = self.estado(raiz)["documents"]
+        self.assertEqual(list(entradas), [self.identificador(raiz, "albaran.md")])
 
     def test_borrar_la_madre_dejando_las_hijas_no_borra_nada(self):
         raiz = self.preparar()

@@ -204,17 +204,21 @@ def ask(question):
         return None
 
 
-def agree(pages):
-    """Pide permiso para borrar, que es la operación que más duele si la lista no es la tuya."""
+def announce(pages):
+    """Lista lo que se va a borrar antes de tocar nada, para poder abortar a tiempo."""
     print("estas páginas están en el manifiesto del último pull y ya no están en el disco:")
     for page in pages:
         print(f"  {page}")
     print()
     print("borrarlas las manda a la papelera de Outline, así que hay vuelta atrás.")
+
+
+def agree():
+    """Si la persona da permiso para borrar, o nada si no hay ninguna al teclado."""
     answer = ask('escribe "si" para borrarlas: ')
     if answer is None:
         print("nadie contesta, así que no se borra nada. Con 'outline push --yes' se borran.")
-        return False
+        return None
     print()
     return answer.strip().lower() in {"s", "si", "sí"}
 
@@ -747,6 +751,39 @@ def remember(root, manifest, relative, document, collection):
 
 
 @dataclass
+class Tally:
+    """Un cubo del resumen del push: cómo se cuenta, bajo qué encabezado se lista y si falla."""
+
+    field: str
+    one: str
+    many: str
+    heading: str = ""
+    failure: bool = False
+
+
+TALLIES = [
+    Tally("uploaded", "página subida", "páginas subidas", "subidas"),
+    Tally("created", "creada", "creadas", "creadas"),
+    Tally("moved", "movida", "movidas", "movidas"),
+    Tally("overtaken", "movida con la remota adelantada", "movidas con la remota adelantada",
+          "movidas, pero Outline tiene texto que no has visto. Pásales un 'outline pull'"),
+    Tally("deleted", "borrada", "borradas", "borradas, a la papelera de Outline"),
+    Tally("settled", "ya estaba en Outline", "ya estaban en Outline"),
+    Tally("declined", "que no has querido borrar", "que no has querido borrar",
+          "sin borrar, porque has dicho que no"),
+    Tally("clashed", "en conflicto", "en conflicto",
+          "en conflicto, la remota se adelantó desde el último pull", True),
+    Tally("unsure", "sin comparar", "sin comparar",
+          "sin comparar, así que no se han tocado", True),
+    Tally("rejected", "sin crear", "sin crear",
+          "sin crear, porque la ruta o el fichero no dicen dónde va", True),
+    Tally("unmoved", "sin mover", "sin mover",
+          "sin mover, porque la ruta nueva no dice dónde van", True),
+    Tally("spared", "sin borrar", "sin borrar", "sin borrar, así que siguen en Outline", True),
+]
+
+
+@dataclass
 class Pusher:
     """Una pasada de push: de dónde lee, contra qué compara y qué lleva hecho."""
 
@@ -760,14 +797,16 @@ class Pusher:
     uploaded: list = field(default_factory=list)
     created: list = field(default_factory=list)
     moved: list = field(default_factory=list)
+    overtaken: list = field(default_factory=list)
     deleted: list = field(default_factory=list)
+    settled: list = field(default_factory=list)
+    declined: list = field(default_factory=list)
     clashed: list = field(default_factory=list)
     unsure: list = field(default_factory=list)
     rejected: list = field(default_factory=list)
     unmoved: list = field(default_factory=list)
     spared: list = field(default_factory=list)
-    notes: list = field(default_factory=list)
-    settled: int = 0
+    note: str = ""
 
     def update(self, relative, document_id, entry):
         """Sube una página que Outline ya conoce, si nadie se ha adelantado.
@@ -792,7 +831,7 @@ class Pusher:
         remote_body = page_body(remote["title"], remote.get("text"))
         if local == remote_body:
             remember(self.root, self.manifest, was_at, remote, collection)
-            self.settled += 1
+            self.settled.append(f"wiki/{relative}")
             return True
         if entry is None or base is None:
             self.unsure.append(
@@ -894,6 +933,13 @@ class Pusher:
         before, _, previous = self.nesting(was_at)
         if before is not None and before["id"] == collection["id"] and previous == nest:
             return True
+        entry = self.manifest[document_id]
+        remote = fetch_document(self.client, document_id)
+        if remote is None:
+            self.unmoved.append(f"wiki/{relative}, sin contenido accesible en Outline")
+            return False
+        remote_body = page_body(remote["title"], remote.get("text"))
+        overtaken = advanced_by_revision(remote, entry, self.base_of(was_at), remote_body)
         payload = {
             "id": document_id,
             "collectionId": collection["id"],
@@ -905,24 +951,35 @@ class Pusher:
         moved = next(
             (d for d in answer.get("documents") or [] if d["id"] == document_id), None
         )
-        entry = self.manifest[document_id]
-        # Mover sube la revisión aunque el texto no cambie, así que con la de antes el push
-        # siguiente vería un conflicto que no existe. Sin ella, la comparación cae al cuerpo.
-        entry["revision"] = moved.get("revision") if moved else None
+        if moved is None:
+            self.unmoved.append(f"wiki/{relative}, sin respuesta de Outline al moverla")
+            return False
+        # Mover sube la revisión aunque el texto no cambie, y quedarse con la de antes daría un
+        # conflicto que no existe. Pero con Outline por delante la nueva taparía lo que no he
+        # visto, así que ahí se queda la vieja y lo arregla el pull siguiente.
+        if not overtaken:
+            entry["revision"] = moved.get("revision")
         entry["collection"] = collection["name"]
         entry["collectionId"] = collection["id"]
-        self.moved.append(f"wiki/{relative}, desde wiki/{was_at}")
+        destino = self.overtaken if overtaken else self.moved
+        destino.append(f"wiki/{relative}, desde wiki/{was_at}")
         return True
+
+    def base_of(self, relative):
+        """El cuerpo de la base como está ahora en el disco, no como estaba al empezar."""
+        path = self.root / STATE_DIR / "base" / relative
+        return path.read_text(encoding="utf-8") if path.is_file() else None
 
     def settle_path(self, document_id, relative, was_at):
         """Muda la base con el fichero y apunta en el manifiesto dónde vive ahora."""
         if was_at == relative:
             return
-        base = self.root / STATE_DIR / "base"
-        if (base / was_at).is_file():
-            write(base / relative, (base / was_at).read_text(encoding="utf-8"))
+        base = self.base_of(was_at)
+        if base is not None:
+            write(self.root / STATE_DIR / "base" / relative, base)
             if was_at not in self.mirror.bodies:
-                discard(base / was_at, base)
+                shadow_dir = self.root / STATE_DIR / "base"
+                discard(shadow_dir / was_at, shadow_dir)
         self.manifest[document_id]["path"] = relative
 
     def remove(self, doomed, confirmed, complete):
@@ -939,16 +996,24 @@ class Pusher:
         if not pending:
             return
         pages = [f"wiki/{entry['path']}" for _, entry in pending]
+        announce(pages)
         if not complete:
             self.spared.extend(pages)
-            self.notes.append(
-                "no se borra nada porque el último pull no terminó: un fichero que falta "
-                "puede ser un fallo de red y no un borrado tuyo. Pasa un 'outline pull'."
+            self.note = (
+                "no se borra nada porque el último pull no terminó. Un fichero que falta puede "
+                "ser un fallo de red y no un borrado tuyo, así que pasa un 'outline pull'."
             )
             return
-        if not confirmed and not agree(pages):
+        answer = True if confirmed else agree()
+        if answer is None:
             self.spared.extend(pages)
-            return
+        elif not answer:
+            self.declined.extend(pages)
+        else:
+            self.trash(pending)
+
+    def trash(self, pending):
+        """Manda las páginas a la papelera y las quita del manifiesto y de la base."""
         condemned = {document_id for document_id, _ in pending}
         shadow_dir = self.root / STATE_DIR / "base"
         for document_id, entry in pending:
@@ -962,49 +1027,20 @@ class Pusher:
 
     def tell(self):
         """Cuenta cómo fue la pasada y devuelve el código de salida."""
-        partes = []
-        if self.uploaded:
-            partes.append(plural(len(self.uploaded), "página subida", "páginas subidas"))
-        if self.created:
-            partes.append(plural(len(self.created), "creada", "creadas"))
-        if self.moved:
-            partes.append(plural(len(self.moved), "movida", "movidas"))
-        if self.deleted:
-            partes.append(plural(len(self.deleted), "borrada", "borradas"))
-        if self.settled:
-            partes.append(plural(self.settled, "ya estaba en Outline", "ya estaban en Outline"))
-        if self.clashed:
-            partes.append(f"{len(self.clashed)} en conflicto")
-        if self.unsure:
-            partes.append(f"{len(self.unsure)} sin comparar")
-        if self.rejected:
-            partes.append(f"{len(self.rejected)} sin crear")
-        if self.unmoved:
-            partes.append(f"{len(self.unmoved)} sin mover")
-        if self.spared:
-            partes.append(f"{len(self.spared)} sin borrar")
+        counted = [(tally, getattr(self, tally.field)) for tally in TALLIES]
+        partes = [plural(len(p), tally.one, tally.many) for tally, p in counted if p]
         print(f"{', '.join(partes) or 'nada que subir'} en {self.scope.label()}")
-        section("subidas", self.uploaded)
-        section("creadas", self.created)
-        section("movidas", self.moved)
-        section("borradas, a la papelera de Outline", self.deleted)
-        section("en conflicto, la remota se adelantó desde el último pull", self.clashed)
-        section("sin comparar, así que no se han tocado", self.unsure)
-        section("sin crear, porque la ruta o el fichero no dicen dónde va", self.rejected)
-        section("sin mover, porque la ruta nueva no dice dónde van", self.unmoved)
-        section("sin borrar, así que siguen en Outline", self.spared)
-        for note in self.notes:
-            print(note)
+        for tally, pages in counted:
+            if tally.heading:
+                section(tally.heading, pages)
+        if self.note:
+            print(self.note)
         if self.clashed:
             print(
                 "mira los dos diffs con 'outline diff', deja el fichero como quieras "
                 "y márcalo con 'outline resolve'."
             )
-        return (
-            1
-            if self.clashed or self.unsure or self.rejected or self.unmoved or self.spared
-            else 0
-        )
+        return 1 if any(pages for tally, pages in counted if tally.failure) else 0
 
 
 def push(client, root, todas, confirmed=False):
@@ -1039,8 +1075,7 @@ def push(client, root, todas, confirmed=False):
     )
 
     # Borrada es la que estaba en el manifiesto del último pull y ya no está en mi disco,
-    # nunca la que está en Outline y no en mi disco. Se apunta antes de crear nada, porque
-    # una página recién creada tampoco estaría en ese manifiesto.
+    # nunca la que está en Outline y no en mi disco. Se apunta antes de crear nada.
     alive = {document_id for document_id in identity_of.values() if document_id}
     doomed = [
         (document_id, dict(entry))

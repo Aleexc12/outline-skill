@@ -110,15 +110,16 @@ Nace al final de su nivel.
 Arrastrar el fichero a otra carpeta.
 Un documento con hijas ocupa dos entradas, su propio `.md` y una carpeta hermana con el mismo
 nombre donde van las hijas, así que hay que llevarse las dos.
+Si Outline tiene texto que no has visto, la mueve igual y te dice que le pases un `pull`.
 
 **Renombrar.**
-Cambiar el encabezado de nivel 1, que es donde vive el título y no hay otro sitio donde viva.
+Cambiar el encabezado de nivel 1, que es el único sitio donde vive el título.
 El nombre del fichero sale de ese título, así que el `pull` siguiente renombra el fichero.
 
 **Borrar.**
 Borrar el fichero, y el `push` manda la página a la papelera de Outline, de donde se recupera.
-Antes lista las páginas que va a borrar y pide confirmación: sin nadie al teclado no borra nada
-y hay que repetir con `outline push --yes`.
+Antes lista las páginas que va a borrar y pide confirmación.
+Sin nadie al teclado no borra nada, así que hay que repetir con `outline push --yes`.
 El borrado se calcula como "estaba en el manifiesto del último `pull` y ya no está en el disco",
 así que ni una colección fuera del ámbito ni una página que otra persona creó después de ese
 `pull` cuentan nunca como borradas.

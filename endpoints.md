@@ -10,8 +10,8 @@ Los marcados como **probado** se han ejecutado contra la instancia real.
 Los marcados como **sin probar** salen de la especificación oficial y conviene confirmarlos
 la primera vez que se usen.
 
-El texto de una página no se escribe por aquí: eso es editar su `.md` y hacer `outline push`,
-como cuenta el `SKILL.md`.
+El texto de una página no se escribe por aquí, sino editando su `.md` y haciendo
+`outline push`, como cuenta el `SKILL.md`.
 Esto es para lo demás.
 
 El token y la dirección viven en las variables de entorno de usuario, así que ya están puestos:
@@ -24,8 +24,9 @@ API=$OUTLINE_URL/api
 El cuerpo se construye con `jq -n --arg` y se envía por stdin con `--data-binary @-`,
 nunca dentro de `-d "..."`.
 En Windows los argumentos de proceso pasan por la página de códigos del sistema y el UTF-8 se
-pierde: cada acento llega a Outline como `�`, y como Outline es la fuente de verdad, el
-destrozo es permanente.
+pierde.
+Cada acento llega a Outline como `�`, y como Outline es la fuente de verdad, el destrozo es
+permanente.
 
 ## Buscar sin bajarse la wiki
 
@@ -78,8 +79,9 @@ que quedarse con la revisión que devuelve el movimiento, no con la de antes.
 Y mover una página se lleva a sus hijas con ella, así que reanidar una rama entera es una sola
 llamada sobre su raíz.
 
-Lo normal es no llamar aquí: arrastrar el `.md` a otra carpeta y hacer `outline push` hace esto
-mismo, y además apunta la ruta y la revisión nuevas.
+Lo normal es no llamar aquí.
+Arrastrar el `.md` a otra carpeta y hacer `outline push` hace esto mismo, y además apunta la
+ruta y la revisión nuevas.
 
 ## Borrar y archivar
 
@@ -97,8 +99,9 @@ una, así que una rama entera se borra con una sola llamada sobre su raíz.
 
 `documents.deleted` **probado** lista lo que hay en la papelera y no recibe más que paginación.
 
-Igual que con el movimiento, lo normal es no llamar aquí: borrar el `.md` y su carpeta y hacer
-`outline push` manda la página a la papelera después de listar lo que se va y pedir confirmación.
+Igual que con el movimiento, lo normal es no llamar aquí.
+Borrar el `.md` y su carpeta y hacer `outline push` manda la página a la papelera, después de
+listar lo que se va y pedir confirmación.
 
 `documents.archive` **probado** saca la página de la barra lateral sin borrarla,
 y solo necesita `id`.

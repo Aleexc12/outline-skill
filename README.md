@@ -90,6 +90,8 @@ de nivel 1, que viaja aparte del cuerpo para que no salga duplicado.
 
 Mover una página es arrastrar su `.md` a otra carpeta, y el `push` la reanida en Outline sin
 perder historial, comentarios ni enlaces.
+Si Outline tiene texto que no has visto, la mueve igual, porque mover no pisa nada, pero se
+queda con la revisión de antes y te dice que le pases un `pull`.
 Un documento con hijas ocupa dos entradas, su propio `.md` y una carpeta hermana con el mismo
 nombre, así que hay que llevarse las dos.
 Renombrarla es cambiar su encabezado de nivel 1: el nombre del fichero sale de ese título, y lo
@@ -101,13 +103,16 @@ Como es la operación que más duele si te equivocas, lleva cuatro barreras.
 El borrado se calcula como "estaba en el manifiesto del último `pull` y ya no está en el disco",
 nunca como "está en Outline y no en el disco", así que ni una colección fuera del ámbito ni una
 página que otra persona creó después de ese `pull` cuentan como borradas.
-Si el último `pull` no dejó la marca de completo, el `push` no borra: un fichero que falta puede
-ser un fallo de red.
+Si el último `pull` no dejó la marca de completo, el `push` no borra, porque un fichero que
+falta puede ser un fallo de red.
 Antes de borrar lista las páginas afectadas y pide confirmación, y sin nadie al teclado no borra
 nada, así que hay que repetir con `outline push --yes`.
 Y la llamada va siempre a la papelera, nunca es permanente.
-Outline se lleva la rama entera, así que borrar una página con hijas es borrar también su
-carpeta; con hijas vivas en el disco el `push` no la borra y lo dice.
+
+Aparte de esas cuatro, Outline se lleva la rama entera al borrar, así que borrar una página con
+hijas es borrar también su carpeta.
+Con hijas vivas en el disco el `push` no la borra y lo dice, porque si no borraría en Outline
+páginas que nadie pidió borrar.
 
 Ante un conflicto, la herramienta nunca escribe marcadores dentro del fichero.
 En Markdown no hay compilador que avise, y un `<<<<<<<` que se escape acaba publicado en la
