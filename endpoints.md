@@ -10,8 +10,22 @@ Los marcados como **probado** se han ejecutado contra la instancia real.
 Los marcados como **sin probar** salen de la especificación oficial y conviene confirmarlos
 la primera vez que se usen.
 
+El texto de una página no se escribe por aquí: eso es editar su `.md` y hacer `outline push`,
+como cuenta el `SKILL.md`.
+Esto es para lo demás.
+
+El token y la dirección viven en las variables de entorno de usuario, así que ya están puestos:
+
+```bash
+TOKEN=$OUTLINE_API_TOKEN
+API=$OUTLINE_URL/api
+```
+
 El cuerpo se construye con `jq -n --arg` y se envía por stdin con `--data-binary @-`,
-nunca dentro de `-d "..."`, que destroza los acentos. La regla 6 del `SKILL.md` lo explica.
+nunca dentro de `-d "..."`.
+En Windows los argumentos de proceso pasan por la página de códigos del sistema y el UTF-8 se
+pierde: cada acento llega a Outline como `�`, y como Outline es la fuente de verdad, el
+destrozo es permanente.
 
 ## Buscar sin bajarse la wiki
 
@@ -55,12 +69,17 @@ Devuelve los documentos y colecciones afectados, que es una respuesta grande, as
 conviene filtrarla con `jq`.
 El documento que devuelve ya trae la revisión de después del movimiento.
 
-Tres cosas comprobadas contra la instancia el 2026-09-07, porque el `push` depende de ellas.
+Cuatro cosas comprobadas contra la instancia el 2026-09-07, porque el `push` depende de ellas.
 `documents.create` no acepta posición, y Outline cuelga la página nueva **al principio** de su
 nivel, no al final.
 Un `index` mayor que el número de hermanos no falla, se recorta y la deja la última.
 Mover sube la revisión del documento aunque el texto no cambie, así que quien mueva algo tiene
 que quedarse con la revisión que devuelve el movimiento, no con la de antes.
+Y mover una página se lleva a sus hijas con ella, así que reanidar una rama entera es una sola
+llamada sobre su raíz.
+
+Lo normal es no llamar aquí: arrastrar el `.md` a otra carpeta y hacer `outline push` hace esto
+mismo, y además apunta la ruta y la revisión nuevas.
 
 ## Borrar y archivar
 
@@ -73,11 +92,18 @@ que quedarse con la revisión que devuelve el movimiento, no con la de antes.
 
 Sin `permanent` la página se puede recuperar desde la papelera de Outline.
 Con `permanent: true` no hay recuperación posible salvo restaurando el backup de la VPS.
+Borrar una página manda a la papelera también a sus hijas **probado**, con un `deletedAt` cada
+una, así que una rama entera se borra con una sola llamada sobre su raíz.
+
+`documents.deleted` **probado** lista lo que hay en la papelera y no recibe más que paginación.
+
+Igual que con el movimiento, lo normal es no llamar aquí: borrar el `.md` y su carpeta y hacer
+`outline push` manda la página a la papelera después de listar lo que se va y pedir confirmación.
 
 `documents.archive` **probado** saca la página de la barra lateral sin borrarla,
 y solo necesita `id`.
 Es la opción correcta para documentación obsoleta que conviene conservar.
-Una página archivada desaparece de `wiki/` en la siguiente sincronización.
+Una página archivada desaparece de `wiki/` en el `pull` siguiente, si no la tenías tocada.
 
 ## Imágenes y adjuntos
 
@@ -130,7 +156,7 @@ El Python es el de Windows y no ve el `/tmp` de Git Bash, así que los dos fiche
 El tope de subida lo dice el propio formulario, en `maxUploadSize`: 1.000.000 bytes.
 Un PNG de 2200x1200 a 200 ppp ronda los 90 KB, así que las figuras del análisis caben de sobra.
 
-**Colocar la imagen en la página** es un `patch` normal sobre el markdown, con la sintaxis propia de Outline:
+**Colocar la imagen en la página** es escribir en su `.md` y hacer `outline push`, con la sintaxis propia de Outline:
 
 ```markdown
 ![](/api/attachments.redirect?id=<id-del-adjunto> " =733.3333333333334x400")
@@ -172,7 +198,7 @@ jq -n --arg id "<id>" '{id: $id, permission: "read_write"}' \
 | jq -c '{name: .data.name, permission: .data.permission}'
 ```
 
-`collections.list` y `collections.documents` ya los usa el script de sincronización.
+`collections.list` y `collections.documents` ya los usa la herramienta.
 El segundo devuelve el árbol ordenado tal y como se ve en la barra lateral, con `children` anidados.
 
 ## Equipo

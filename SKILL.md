@@ -13,28 +13,17 @@ Los comandos se ejecutan desde la raíz del proyecto.
 
 ## Reglas
 
-1. **Editar el `.md` y hacer `outline push` es la forma de escribir.**
-   El `push` sube solo las páginas que has tocado, manda el cuerpo sin el frontmatter y saca
-   el título del encabezado de nivel 1.
-   Un `.md` nuevo en la carpeta que le toca crea la página, con la colección y la madre
-   deducidas de su ruta.
-   Si esa página se movió en Outline desde tu último `pull`, el `push` no la toca y lo dice.
-   `outline diff` enseña los dos lados y `outline resolve` da el conflicto por resuelto.
-   Escribir por API, más abajo, es para lo que no cabe en un fichero.
+1. **Escribir es editar el Markdown de `wiki/` y hacer `outline push`.**
+   Nunca se construye una petición HTTP para cambiar el texto de una página.
+   Editando ficheros, los acentos, el formato dentro de los bloques de código y la coincidencia
+   exacta del texto dejan de ser fuentes de error.
 2. **Leer siempre en local.**
    Un documento por `documents.info` cuesta de 4 a 6 veces más contexto que su `.md`.
-3. **Antes de escribir: `status`, o `check` de esa página, y `pull` si está desactualizada.**
-   Editar sobre una copia vieja acaba en un conflicto que el `push` rebota, y en rehacer
-   el trabajo.
-   Para una página nueva no hay nada que comprobar, así que ahí se baja directamente, que
-   hace falta para ver el árbol actual, elegir dónde colocarla y no duplicar algo que ya existe.
+3. **Leer `.outline/index.md` antes de crear una página.**
+   Trae el árbol entero con títulos, jerarquía e identificadores, que es lo que hace falta para
+   elegir dónde colgarla sin preguntar y sin duplicar algo que ya existe.
 4. **Filtrar toda respuesta de la API con `jq`.**
    Las respuestas traen el documento entero más su árbol JSON del editor.
-5. **Construir el cuerpo con `jq -n --arg` y enviarlo por stdin con `--data-binary @-`.**
-   Pasar el JSON dentro de `-d "..."` corrompe las tildes y las eñes: en Windows los
-   argumentos de proceso pasan por la página de códigos del sistema y el UTF-8 se pierde.
-   El título llega a Outline con `�` en lugar de cada acento, y como Outline es la
-   fuente de verdad, el destrozo es permanente.
 
 ## Leer
 
@@ -87,119 +76,66 @@ outline check "nombre de la pagina"
 
 ## Escribir
 
-Editando el fichero y empujándolo:
+Cada operación es un cambio en el disco, y `outline push` la lleva a Outline.
+
+| En el disco | En Outline |
+|---|---|
+| editar el cuerpo de un `.md` | cambia el texto de la página |
+| cambiar su encabezado de nivel 1 | la renombra |
+| crear un `.md` en la carpeta que le toca | crea la página, colgada de donde diga la ruta |
+| arrastrar el `.md` a otra carpeta | la reanida, sin perder historial, comentarios ni enlaces |
+| borrar el `.md` | la manda a la papelera |
 
 ```bash
-outline push            # sube lo tocado y crea los .md que no están en Outline
-outline diff "pagina"   # los dos diffs contra la base, el tuyo y el de Outline
+outline push             # sube lo tocado, crea, mueve y renombra
+outline push --yes       # además confirma los borrados
+outline diff "pagina"    # los dos diffs contra la base, el tuyo y el de Outline
 outline resolve "pagina" # da el conflicto por resuelto, sin tocar tu fichero
 ```
 
+El cuerpo que se manda no lleva el frontmatter ni repite el título.
+El identificador de una página recién creada vuelve al frontmatter del fichero local.
 El `push` nunca escribe marcadores de conflicto dentro de un fichero.
-El cuerpo que manda no lleva el frontmatter ni repite el título, y el identificador de una
-página recién creada vuelve al frontmatter del fichero local.
-
-Por API, para lo que no es el texto de una página.
-Ahí no hay comprobación de revisión que pare nada, así que un `replace` del cuerpo entero pisa
-a quien esté editando otra sección.
-Con `patch` y `append` el cambio se queda en lo que tocas.
-
-El token y la dirección viven en las variables de entorno de usuario, así que ya están puestos:
-
-```bash
-TOKEN=$OUTLINE_API_TOKEN
-API=$OUTLINE_URL/api
-```
 
 **Página nueva.**
-Dónde colocarla se decide leyendo `.outline/index.md`, que trae el árbol entero con títulos
-y jerarquía: basta para elegir colección y página padre sin preguntar.
-Lo normal es colgarla de la página con la que comparte tema, y dejarla en la raíz de la
-colección solo cuando abre un tema nuevo.
-Crear el `.md` en local no crea la página: se decide leyendo el espejo local y se escribe
-en Outline, que es lo que el siguiente `pull` refleja.
+Un `.md` en la carpeta que le toca.
+La colección y la página madre salen de su ruta, así que la jerarquía del disco y la de Outline
+son la misma cosa: `wiki/chapa/pintura.md` cuelga de `wiki/chapa.md`.
+Dónde colocarla se decide leyendo `.outline/index.md`.
+Lo normal es colgarla de la página con la que comparte tema, y dejarla en la raíz de la colección
+solo cuando abre un tema nuevo.
+Nace al final de su nivel.
 
-Sin `publish` la página queda como borrador y no la ve nadie.
-El `collectionId` no está en el manifiesto, que solo guarda el nombre de la colección,
-y una colección vacía no aparece ahí en absoluto. Se pide a la API:
+**Mover.**
+Arrastrar el fichero a otra carpeta.
+Un documento con hijas ocupa dos entradas, su propio `.md` y una carpeta hermana con el mismo
+nombre donde van las hijas, así que hay que llevarse las dos.
 
-```bash
-jq -n '{limit: 100}' \
-| curl -s -X POST $API/collections.list \
-    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    --data-binary @- \
-| jq -c '.data[] | {id, name, permission}'
-```
+**Renombrar.**
+Cambiar el encabezado de nivel 1, que es donde vive el título y no hay otro sitio donde viva.
+El nombre del fichero sale de ese título, así que el `pull` siguiente renombra el fichero.
 
-```bash
-jq -n --arg title "Título" --arg collection "<id>" \
-  --arg text "Entradilla.
+**Borrar.**
+Borrar el fichero, y el `push` manda la página a la papelera de Outline, de donde se recupera.
+Antes lista las páginas que va a borrar y pide confirmación: sin nadie al teclado no borra nada
+y hay que repetir con `outline push --yes`.
+El borrado se calcula como "estaba en el manifiesto del último `pull` y ya no está en el disco",
+así que ni una colección fuera del ámbito ni una página que otra persona creó después de ese
+`pull` cuentan nunca como borradas.
+Si el último `pull` no terminó tampoco borra, porque un fichero que falta puede ser un fallo de
+red y no un borrado tuyo.
+Outline se lleva a la papelera el árbol entero, así que borrar una página con hijas es borrar
+también su carpeta; con hijas vivas en el disco, el `push` no la borra y lo dice.
 
-## Apartado
-
-Contenido." \
-  '{title: $title, text: $text, collectionId: $collection, publish: true}' \
-| curl -s -X POST $API/documents.create \
-    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    --data-binary @- \
-| jq -c '{id: .data.id, url: .data.url}'
-```
-
-El `text` no debe empezar por un encabezado de nivel 1: el título es un campo aparte y saldría duplicado.
-Los encabezados del cuerpo empiezan en `##`.
-
-**Página anidada.**
-Añadir `parentDocumentId` para que nazca colgando de otra página, con su id sacado de `.outline/index.md`.
-Cualquier documento puede ser padre, y la profundidad no está limitada.
-Las colecciones, en cambio, no se anidan entre sí: la jerarquía se construye siempre con documentos.
-
-```bash
-jq -n --arg title "Título" --arg collection "<id>" --arg parent "<id-padre>" \
-  '{title: $title, text: "Contenido.", collectionId: $collection, parentDocumentId: $parent, publish: true}' \
-| curl -s -X POST $API/documents.create \
-    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    --data-binary @- \
-| jq -c '{id: .data.id, url: .data.url}'
-```
-
-Para reanidar una página que ya existe está `documents.move`, en `endpoints.md`.
-
-En `wiki/` un documento con hijos genera dos entradas: su propio `.md` y una carpeta hermana
-con el mismo nombre donde van los hijos.
-
-**Añadir al final.**
-
-```bash
-jq -n --arg id "<id>" --arg text "
-## Sección nueva
-
-Contenido.
-" \
-  '{id: $id, text: $text, editMode: "append"}' \
-| curl -s -X POST $API/documents.update \
-    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    --data-binary @- \
-| jq -c '{id: .data.id, revision: .data.revision}'
-```
-
-**Sustituir un fragmento.**
-`findText` es obligatorio con `patch` y debe coincidir exactamente con el texto actual.
-
-```bash
-jq -n --arg id "<id>" --arg viejo "texto viejo" --arg nuevo "texto nuevo" \
-  '{id: $id, editMode: "patch", findText: $viejo, text: $nuevo}' \
-| curl -s -X POST $API/documents.update \
-    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    --data-binary @- \
-| jq -c '{id: .data.id, revision: .data.revision}'
-```
-
-Después de escribir, hacer `outline pull` otra vez para que la copia local recoja la revisión nueva.
+**Conflictos.**
+Si la página se movió en Outline desde tu último `pull`, el `push` no la toca y lo dice.
+`outline diff` enseña los dos lados contra la base y `outline resolve` da el conflicto por
+resuelto, adelantando la base al remoto de ahora mismo y sin tocar tu fichero.
 
 ## Más endpoints
 
-`endpoints.md`, en esta misma carpeta, tiene los parámetros de búsqueda, mover, borrar,
-subir imágenes, crear colecciones e invitar gente.
+`endpoints.md`, en esta misma carpeta, tiene lo que no es el texto de una página: buscar, mover
+y borrar por API, subir imágenes, crear colecciones e invitar gente.
 
 ## Avisos
 
@@ -208,11 +144,6 @@ el historial de revisiones y el estado del editor colaborativo.
 
 Un cambio por API sobre una página que alguien tiene abierta en el editor colaborativo
 puede necesitar un refresco de la pestaña para verse.
-
-El `text` de un `patch` se parsea como Markdown antes de insertarse, también cuando cae dentro
-de un bloque de código, donde el formato no existe y se pierde: enviar `**Después.**` deja
-`Después.` y escaparlo deja las barras a la vista. Para tocar dentro de un bloque de código
-hay que reemplazarlo entero, con sus tres comillas de apertura y cierre dentro del `findText`.
 
 No conectar el servidor MCP de Outline.
 Sus 19 definiciones de herramientas ocuparían contexto en todas las sesiones, use la wiki o no,

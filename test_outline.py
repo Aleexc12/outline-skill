@@ -11,6 +11,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -44,26 +45,30 @@ class Transporte:
         self.arboles = {}
         self.romper = None
         self.inaccesibles = set()
+        self.papelera = []
+        self.destruidos = []
         self.creados = 0
         for indice, (nombre, nodos) in enumerate(arbol.items(), start=1):
             coleccion = f"col-{indice}"
             self.colecciones.append({"id": coleccion, "name": nombre})
             self.arboles[coleccion] = self._construir(nodos, coleccion)
 
-    def _construir(self, nodos, coleccion):
+    def _construir(self, nodos, coleccion, padre=None):
         salida = []
         for nodo in nodos:
-            documento_id = self._alta(nodo["title"], nodo["text"], coleccion)
+            documento_id = self._alta(nodo["title"], nodo["text"], coleccion, padre)
             salida.append(
                 {
                     "id": documento_id,
                     "title": nodo["title"],
-                    "children": self._construir(nodo.get("children", []), coleccion),
+                    "children": self._construir(
+                        nodo.get("children", []), coleccion, documento_id
+                    ),
                 }
             )
         return salida
 
-    def _alta(self, titulo, texto, coleccion):
+    def _alta(self, titulo, texto, coleccion, padre=None):
         self.creados += 1
         documento_id = f"doc-{self.creados:03d}"
         self.documentos[documento_id] = {
@@ -75,6 +80,7 @@ class Transporte:
             "urlId": documento_id,
             "url": f"/doc/{documento_id}",
             "collectionId": coleccion,
+            "parentDocumentId": padre,
         }
         return documento_id
 
@@ -108,7 +114,7 @@ class Transporte:
         if endpoint == "documents.create":
             padre = payload.get("parentDocumentId")
             coleccion = payload.get("collectionId") or self.documentos[padre]["collectionId"]
-            documento_id = self._alta(payload["title"], payload["text"], coleccion)
+            documento_id = self._alta(payload["title"], payload["text"], coleccion, padre)
             nodo = {"id": documento_id, "title": payload["title"], "children": []}
             nivel = self.arboles[coleccion]
             if padre:
@@ -127,9 +133,26 @@ class Transporte:
                 nivel = self._buscar(nivel, padre)["children"]
             nivel.insert(min(payload.get("index", 0), len(nivel)), nodo)
             documento["collectionId"] = coleccion
+            documento["parentDocumentId"] = padre
             documento["revision"] += 1
             return {"data": {"documents": [dict(documento)], "collections": []}}
+        if endpoint == "documents.delete":
+            documento = self.documentos[payload["id"]]
+            nodo = self._buscar(self.arboles[documento["collectionId"]], payload["id"])
+            destino = self.destruidos if payload.get("permanent") else self.papelera
+            for descendiente in self._rama(nodo):
+                destino.append(descendiente)
+                del self.documentos[descendiente]
+            for coleccion, arbol in self.arboles.items():
+                self.arboles[coleccion] = self._podar(arbol, payload["id"])
+            return {"data": None}
         raise AssertionError(f"endpoint no guionizado: {endpoint}")
+
+    def _rama(self, nodo):
+        """El nodo y su descendencia, que es lo que Outline se lleva de una sola vez."""
+        yield nodo["id"]
+        for hijo in nodo["children"]:
+            yield from self._rama(hijo)
 
     def _buscar(self, nodos, documento_id):
         for nodo in nodos:
@@ -165,6 +188,15 @@ class Transporte:
         """Las peticiones que cambian algo en Outline, en el orden en que se hicieron."""
         return [(e, p) for e, p in self.peticiones if e in ESCRITURAS]
 
+    def crear(self, titulo, texto, coleccion="col-1", padre=None):
+        """Una socia crea una página en Outline después de mi último pull."""
+        documento_id = self._alta(titulo, texto, coleccion, padre)
+        nivel = self.arboles[coleccion]
+        if padre:
+            nivel = self._buscar(nivel, padre)["children"]
+        nivel.append({"id": documento_id, "title": titulo, "children": []})
+        return documento_id
+
     def borrar(self, documento_id):
         del self.documentos[documento_id]
         for coleccion, arbol in self.arboles.items():
@@ -185,6 +217,13 @@ class Transporte:
         return {"data": items, "pagination": {"total": len(items)}}
 
 
+class Teclado(io.StringIO):
+    """Un stdin con alguien delante, que es lo que hace que el push llegue a preguntar."""
+
+    def isatty(self):
+        return True
+
+
 class Caso(unittest.TestCase):
     def setUp(self):
         self.transporte = Transporte()
@@ -203,6 +242,14 @@ class Caso(unittest.TestCase):
 
         os.environ["OUTLINE_URL"] = "https://wiki.ejemplo.com"
         os.environ["OUTLINE_API_TOKEN"] = "token-de-prueba"
+
+        # Sin nadie al teclado por defecto, para que ninguna pregunta cuelgue la suite.
+        self.addCleanup(setattr, sys, "stdin", sys.stdin)
+        sys.stdin = io.StringIO()
+
+    def teclear(self, respuesta):
+        """Lo que la persona contesta cuando el push pide confirmación."""
+        sys.stdin = Teclado(respuesta + "\n")
 
     def proyecto(self, nombre):
         raiz = self.temporal / nombre
@@ -274,6 +321,12 @@ class Caso(unittest.TestCase):
 
     def identificador_remoto(self, titulo):
         return next(d["id"] for d in self.transporte.documentos.values() if d["title"] == titulo)
+
+    def mover_fichero(self, raiz, origen, destino):
+        """Arrastra la página a otra carpeta, como quien reorganiza la wiki."""
+        salida = raiz / "wiki" / destino
+        salida.parent.mkdir(parents=True, exist_ok=True)
+        (raiz / "wiki" / origen).rename(salida)
 
     def montar_conflicto(self):
         """Una página cambiada aquí y en Outline desde el último pull."""
@@ -1318,6 +1371,475 @@ class Push(Caso):
         self.assertEqual(subidos, [self.identificador(raiz, "almacen-nuble/inventario.md")])
 
 
+class PushMueve(Caso):
+    def preparar(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        self.transporte.peticiones.clear()
+        return raiz
+
+    def test_mover_el_fichero_a_otra_carpeta_reanida_la_pagina(self):
+        raiz = self.preparar()
+        albaran = self.identificador(raiz, "albaran.md")
+        diagnostico = self.identificador(raiz, "diagnostico.md")
+        self.mover_fichero(raiz, "albaran.md", "diagnostico/albaran.md")
+
+        self.ejecutar("push")
+
+        escrituras = self.transporte.escrituras()
+        self.assertEqual([e for e, _ in escrituras], ["documents.move"])
+        self.assertEqual(escrituras[0][1]["id"], albaran)
+        self.assertEqual(escrituras[0][1]["parentDocumentId"], diagnostico)
+        self.assertEqual(self.transporte.documentos[albaran]["parentDocumentId"], diagnostico)
+
+    def test_sacar_el_fichero_a_la_raiz_descuelga_la_pagina(self):
+        raiz = self.preparar()
+        auditoria = self.identificador(raiz, "diagnostico/auditoria-de-ruido.md")
+        self.mover_fichero(raiz, "diagnostico/auditoria-de-ruido.md", "auditoria-de-ruido.md")
+
+        self.ejecutar("push")
+
+        endpoint, payload = self.transporte.escrituras()[0]
+        self.assertEqual(endpoint, "documents.move")
+        self.assertNotIn("parentDocumentId", payload)
+        self.assertEqual(payload["collectionId"], "col-1")
+        self.assertIsNone(self.transporte.documentos[auditoria]["parentDocumentId"])
+
+    def test_mover_no_toca_el_texto_de_la_pagina(self):
+        raiz = self.preparar()
+        albaran = self.identificador(raiz, "albaran.md")
+        self.mover_fichero(raiz, "albaran.md", "diagnostico/albaran.md")
+
+        self.ejecutar("push")
+
+        self.assertEqual(self.transporte.documentos[albaran]["text"], "Cuerpo del albarán.")
+
+    def test_tras_mover_el_manifiesto_apunta_a_la_ruta_nueva(self):
+        raiz = self.preparar()
+        albaran = self.identificador(raiz, "albaran.md")
+        self.mover_fichero(raiz, "albaran.md", "diagnostico/albaran.md")
+
+        self.ejecutar("push")
+
+        entrada = self.estado(raiz)["documents"][albaran]
+        self.assertEqual(entrada["path"], "diagnostico/albaran.md")
+
+    def test_tras_mover_la_base_se_muda_con_el_fichero(self):
+        raiz = self.preparar()
+        self.mover_fichero(raiz, "albaran.md", "diagnostico/albaran.md")
+
+        self.ejecutar("push")
+
+        self.assertEqual(
+            self.base(raiz, "diagnostico/albaran.md"), "# Albarán\n\nCuerpo del albarán.\n"
+        )
+        self.assertFalse((raiz / ".outline" / "base" / "albaran.md").exists())
+
+    def test_tras_mover_la_pagina_queda_limpia(self):
+        raiz = self.preparar()
+        self.mover_fichero(raiz, "albaran.md", "diagnostico/albaran.md")
+        self.ejecutar("push")
+
+        salida = self.salida("status")
+
+        self.assertIn("3 limpias", salida)
+
+    def test_la_revision_que_se_apunta_es_la_de_despues_del_movimiento(self):
+        raiz = self.preparar()
+        albaran = self.identificador(raiz, "albaran.md")
+        self.mover_fichero(raiz, "albaran.md", "diagnostico/albaran.md")
+
+        self.ejecutar("push")
+
+        apuntada = self.estado(raiz)["documents"][albaran]["revision"]
+        self.assertEqual(apuntada, self.transporte.documentos[albaran]["revision"])
+
+    def test_moverla_no_deja_un_conflicto_falso_en_el_push_siguiente(self):
+        raiz = self.preparar()
+        self.mover_fichero(raiz, "albaran.md", "diagnostico/albaran.md")
+        self.ejecutar("push")
+        self.editar_local(raiz, "diagnostico/albaran.md", "Una línea mía.")
+
+        salida = self.salida("push")
+
+        self.assertIn("1 página subida", salida)
+        self.assertNotIn("en conflicto", salida)
+
+    def test_el_pull_siguiente_no_devuelve_la_pagina_a_su_sitio(self):
+        raiz = self.preparar()
+        self.mover_fichero(raiz, "albaran.md", "diagnostico/albaran.md")
+        self.ejecutar("push")
+
+        salida = self.salida("pull")
+
+        self.assertTrue((raiz / "wiki" / "diagnostico" / "albaran.md").is_file())
+        self.assertFalse((raiz / "wiki" / "albaran.md").exists())
+        self.assertIn("todo al día", salida)
+
+    def test_mover_y_editar_en_la_misma_pasada(self):
+        raiz = self.preparar()
+        albaran = self.identificador(raiz, "albaran.md")
+        self.mover_fichero(raiz, "albaran.md", "diagnostico/albaran.md")
+        self.editar_local(raiz, "diagnostico/albaran.md", "Una línea mía.")
+
+        self.ejecutar("push")
+
+        self.assertEqual(
+            [e for e, _ in self.transporte.escrituras()],
+            ["documents.update", "documents.move"],
+        )
+        self.assertIn("Una línea mía.", self.transporte.documentos[albaran]["text"])
+        entrada = self.estado(raiz)["documents"][albaran]
+        self.assertEqual(entrada["path"], "diagnostico/albaran.md")
+        self.assertFalse((raiz / ".outline" / "base" / "albaran.md").exists())
+
+    def test_cambiar_solo_el_nombre_del_fichero_no_mueve_nada(self):
+        raiz = self.preparar()
+        albaran = self.identificador(raiz, "albaran.md")
+        self.mover_fichero(raiz, "albaran.md", "albaran-de-2026.md")
+
+        self.ejecutar("push")
+
+        self.assertEqual(self.transporte.escrituras(), [])
+        self.assertEqual(
+            self.estado(raiz)["documents"][albaran]["path"], "albaran-de-2026.md"
+        )
+
+    def test_el_nombre_del_fichero_vuelve_al_del_titulo_en_el_pull_siguiente(self):
+        raiz = self.preparar()
+        self.mover_fichero(raiz, "albaran.md", "albaran-de-2026.md")
+        self.ejecutar("push")
+
+        self.ejecutar("pull")
+
+        self.assertTrue((raiz / "wiki" / "albaran.md").is_file())
+        self.assertFalse((raiz / "wiki" / "albaran-de-2026.md").exists())
+
+    def test_mover_una_pagina_con_hijas_se_lleva_el_arbol_de_una_vez(self):
+        raiz = self.preparar()
+        diagnostico = self.identificador(raiz, "diagnostico.md")
+        albaran = self.identificador(raiz, "albaran.md")
+        auditoria = self.identificador(raiz, "diagnostico/auditoria-de-ruido.md")
+        self.mover_fichero(raiz, "diagnostico.md", "albaran/diagnostico.md")
+        (raiz / "wiki" / "diagnostico").rename(raiz / "wiki" / "albaran" / "diagnostico")
+
+        self.ejecutar("push")
+
+        escrituras = self.transporte.escrituras()
+        self.assertEqual([(e, p["id"]) for e, p in escrituras], [("documents.move", diagnostico)])
+        self.assertEqual(escrituras[0][1]["parentDocumentId"], albaran)
+        entradas = self.estado(raiz)["documents"]
+        self.assertEqual(entradas[auditoria]["path"], "albaran/diagnostico/auditoria-de-ruido.md")
+
+    def test_una_pagina_en_conflicto_no_se_mueve(self):
+        raiz = self.preparar()
+        albaran = self.identificador(raiz, "albaran.md")
+        self.mover_fichero(raiz, "albaran.md", "diagnostico/albaran.md")
+        self.editar_local(raiz, "diagnostico/albaran.md", "Lo que escribí yo.")
+        self.transporte.editar(albaran, "Lo que escribió mi socia.")
+
+        salida = self.salida("push")
+
+        self.assertEqual(self.transporte.escrituras(), [])
+        self.assertIn("en conflicto", salida)
+        self.assertEqual(self.estado(raiz)["documents"][albaran]["path"], "albaran.md")
+
+    def test_mover_bajo_una_pagina_recien_creada(self):
+        raiz = self.preparar()
+        albaran = self.identificador(raiz, "albaran.md")
+        self.crear_local(raiz, "chapa.md", "# Chapa\n\nEl taller de chapa.\n")
+        self.mover_fichero(raiz, "albaran.md", "chapa/albaran.md")
+
+        self.ejecutar("push")
+
+        endpoint, payload = self.transporte.escrituras()[-1]
+        self.assertEqual((endpoint, payload["id"]), ("documents.move", albaran))
+        self.assertEqual(payload["parentDocumentId"], self.identificador(raiz, "chapa.md"))
+
+    def test_mover_a_otra_coleccion_con_all(self):
+        raiz = self.proyecto("Cualquiera")
+        self.ejecutar("pull", "--all")
+        albaran = self.identificador(raiz, "taller/albaran.md")
+        self.transporte.peticiones.clear()
+        self.mover_fichero(raiz, "taller/albaran.md", "almacen-nuble/albaran.md")
+
+        self.ejecutar("push", "--all")
+
+        endpoint, payload = self.transporte.escrituras()[0]
+        self.assertEqual(endpoint, "documents.move")
+        self.assertEqual(payload["collectionId"], "col-2")
+        self.assertNotIn("parentDocumentId", payload)
+        entrada = self.estado(raiz)["documents"][albaran]
+        self.assertEqual(entrada["collection"], "Almacén Ñuble")
+        self.assertEqual(entrada["collectionId"], "col-2")
+
+    def test_mover_deja_la_pagina_al_final_de_su_nivel(self):
+        raiz = self.preparar()
+        self.mover_fichero(raiz, "diagnostico/auditoria-de-ruido.md", "auditoria-de-ruido.md")
+
+        self.ejecutar("push")
+        self.ejecutar("pull")
+
+        indice = (raiz / ".outline" / "index.md").read_text(encoding="utf-8")
+        titulos = [re.search(r"\[(.+?)\]", l).group(1) for l in indice.splitlines() if "- [" in l]
+        self.assertEqual(titulos, ["Diagnóstico", "Albarán", "Auditoría de ruido"])
+
+    def test_mover_a_una_carpeta_sin_pagina_madre_no_mueve_nada(self):
+        raiz = self.preparar()
+        albaran = self.identificador(raiz, "albaran.md")
+        self.mover_fichero(raiz, "albaran.md", "chapa/albaran.md")
+
+        salida = self.salida("push")
+
+        self.assertEqual(self.transporte.escrituras(), [])
+        self.assertIn("wiki/chapa.md", salida)
+        self.assertEqual(self.estado(raiz)["documents"][albaran]["path"], "albaran.md")
+
+    def test_un_fichero_en_una_carpeta_que_no_es_ninguna_coleccion_no_se_mueve(self):
+        raiz = self.proyecto("Cualquiera")
+        self.ejecutar("pull", "--all")
+        self.transporte.peticiones.clear()
+        self.mover_fichero(raiz, "taller/albaran.md", "albaran.md")
+
+        salida = self.salida("push", "--all")
+
+        self.assertEqual(self.transporte.escrituras(), [])
+        self.assertIn("sin mover", salida)
+
+
+class PushRenombra(Caso):
+    def renombrar(self, raiz, ruta, viejo, nuevo):
+        """Cambia el encabezado de nivel 1, que es donde vive el título."""
+        pagina = raiz / "wiki" / ruta
+        texto = pagina.read_text(encoding="utf-8").replace(f"# {viejo}", f"# {nuevo}")
+        pagina.write_text(texto, encoding="utf-8")
+
+    def test_cambiar_el_encabezado_de_nivel_1_renombra_la_pagina(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        albaran = self.identificador(raiz, "albaran.md")
+        self.renombrar(raiz, "albaran.md", "Albarán", "Albarán de entrega")
+
+        self.ejecutar("push")
+
+        self.assertEqual(self.transporte.documentos[albaran]["title"], "Albarán de entrega")
+
+    def test_el_titulo_no_se_queda_dentro_del_cuerpo(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        albaran = self.identificador(raiz, "albaran.md")
+        self.renombrar(raiz, "albaran.md", "Albarán", "Albarán de entrega")
+
+        self.ejecutar("push")
+
+        self.assertNotIn("#", self.transporte.documentos[albaran]["text"])
+
+    def test_tras_renombrar_el_pull_mueve_el_fichero_al_nombre_nuevo(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        self.renombrar(raiz, "albaran.md", "Albarán", "Albarán de entrega")
+        self.ejecutar("push")
+
+        self.ejecutar("pull")
+
+        self.assertTrue((raiz / "wiki" / "albaran-de-entrega.md").is_file())
+        self.assertFalse((raiz / "wiki" / "albaran.md").exists())
+
+    def test_renombrar_no_cambia_de_sitio_a_la_pagina(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        self.transporte.peticiones.clear()
+        self.renombrar(raiz, "diagnostico.md", "Diagnóstico", "Diagnóstico del motor")
+
+        self.ejecutar("push")
+
+        self.assertEqual([e for e, _ in self.transporte.escrituras()], ["documents.update"])
+
+
+class PushBorra(Caso):
+    def preparar(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull")
+        self.transporte.peticiones.clear()
+        return raiz
+
+    def test_borrar_el_fichero_manda_la_pagina_a_la_papelera(self):
+        raiz = self.preparar()
+        albaran = self.identificador(raiz, "albaran.md")
+        (raiz / "wiki" / "albaran.md").unlink()
+
+        self.ejecutar("push", "--yes")
+
+        self.assertEqual(
+            self.transporte.escrituras(),
+            [("documents.delete", {"id": albaran, "permanent": False})],
+        )
+
+    def test_la_llamada_de_borrado_no_es_permanente(self):
+        raiz = self.preparar()
+        albaran = self.identificador(raiz, "albaran.md")
+        (raiz / "wiki" / "albaran.md").unlink()
+
+        self.ejecutar("push", "--yes")
+
+        self.assertEqual(self.transporte.papelera, [albaran])
+        self.assertEqual(self.transporte.destruidos, [])
+
+    def test_tras_borrar_se_limpian_el_manifiesto_y_la_base(self):
+        raiz = self.preparar()
+        albaran = self.identificador(raiz, "albaran.md")
+        (raiz / "wiki" / "albaran.md").unlink()
+
+        self.ejecutar("push", "--yes")
+
+        self.assertNotIn(albaran, self.estado(raiz)["documents"])
+        self.assertFalse((raiz / ".outline" / "base" / "albaran.md").exists())
+
+    def test_antes_de_borrar_lista_las_paginas_afectadas(self):
+        raiz = self.preparar()
+        (raiz / "wiki" / "albaran.md").unlink()
+        self.teclear("si")
+
+        salida = self.salida("push")
+
+        self.assertIn("wiki/albaran.md", salida)
+        self.assertIn("papelera", salida)
+        self.assertEqual(len(self.transporte.papelera), 1)
+
+    def test_contestando_que_no_no_borra_nada(self):
+        raiz = self.preparar()
+        albaran = self.identificador(raiz, "albaran.md")
+        (raiz / "wiki" / "albaran.md").unlink()
+        self.teclear("no")
+
+        salida = self.salida("push")
+
+        self.assertEqual(self.transporte.escrituras(), [])
+        self.assertIn(albaran, self.estado(raiz)["documents"])
+        self.assertIn("sin borrar", salida)
+
+    def test_sin_nadie_al_teclado_no_borra_y_dice_como_confirmar(self):
+        raiz = self.preparar()
+        (raiz / "wiki" / "albaran.md").unlink()
+
+        salida = self.salida("push")
+
+        self.assertEqual(self.transporte.escrituras(), [])
+        self.assertIn("--yes", salida)
+
+    def test_una_pasada_con_borrados_pendientes_sale_con_error(self):
+        raiz = self.preparar()
+        (raiz / "wiki" / "albaran.md").unlink()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(outline.main(["push"]), 1)
+
+    def test_sin_la_marca_de_pull_completo_no_borra(self):
+        raiz = self.preparar()
+        # Un pull que no puede leer una página no deja la marca de completo.
+        self.transporte.inaccesibles.add(self.identificador(raiz, "diagnostico.md"))
+        self.ejecutar("pull")
+        (raiz / "wiki" / "albaran.md").unlink()
+        self.transporte.peticiones.clear()
+
+        salida = self.salida("push", "--yes")
+
+        self.assertEqual(self.transporte.escrituras(), [])
+        self.assertIn("wiki/albaran.md", salida)
+        self.assertIn("el último pull no terminó", salida)
+
+    def test_completado_el_pull_ese_mismo_borrado_sale_adelante(self):
+        raiz = self.preparar()
+        self.transporte.inaccesibles.add(self.identificador(raiz, "diagnostico.md"))
+        self.ejecutar("pull")
+        (raiz / "wiki" / "albaran.md").unlink()
+        self.ejecutar("push", "--yes")
+
+        self.transporte.inaccesibles.clear()
+        self.ejecutar("pull")
+        self.ejecutar("push", "--yes")
+
+        self.assertEqual(len(self.transporte.papelera), 1)
+
+    def test_una_coleccion_fuera_del_ambito_no_se_cuenta_como_borrada(self):
+        raiz = self.proyecto("Taller")
+        self.ejecutar("pull", "--all")
+        self.ejecutar("pull")
+        inventario = self.identificador(raiz, "almacen-nuble/inventario.md")
+        shutil.rmtree(raiz / "wiki" / "almacen-nuble")
+        self.transporte.peticiones.clear()
+
+        self.ejecutar("push", "--yes")
+
+        self.assertEqual(self.transporte.escrituras(), [])
+        self.assertIn(inventario, self.estado(raiz)["documents"])
+
+    def test_una_pagina_creada_en_remoto_despues_del_pull_no_se_borra(self):
+        raiz = self.preparar()
+        ajena = self.transporte.crear("Presupuesto", "Lo que cuesta.")
+
+        self.ejecutar("push", "--yes")
+
+        self.assertEqual(self.transporte.escrituras(), [])
+        self.assertIn(ajena, self.transporte.documentos)
+
+    def test_una_pagina_que_muevo_no_se_cuenta_como_borrada(self):
+        raiz = self.preparar()
+        self.mover_fichero(raiz, "albaran.md", "diagnostico/albaran.md")
+
+        self.ejecutar("push", "--yes")
+
+        self.assertEqual([e for e, _ in self.transporte.escrituras()], ["documents.move"])
+
+    def test_borrar_una_carpeta_entera_llama_una_sola_vez(self):
+        raiz = self.preparar()
+        diagnostico = self.identificador(raiz, "diagnostico.md")
+        auditoria = self.identificador(raiz, "diagnostico/auditoria-de-ruido.md")
+        (raiz / "wiki" / "diagnostico.md").unlink()
+        shutil.rmtree(raiz / "wiki" / "diagnostico")
+
+        self.ejecutar("push", "--yes")
+
+        self.assertEqual(
+            self.transporte.escrituras(),
+            [("documents.delete", {"id": diagnostico, "permanent": False})],
+        )
+        self.assertEqual(self.transporte.papelera, [diagnostico, auditoria])
+        entradas = self.estado(raiz)['''documents''']
+        self.assertEqual(list(entradas), [self.identificador(raiz, '''albaran.md''')])
+
+    def test_borrar_la_madre_dejando_las_hijas_no_borra_nada(self):
+        raiz = self.preparar()
+        diagnostico = self.identificador(raiz, "diagnostico.md")
+        (raiz / "wiki" / "diagnostico.md").unlink()
+
+        salida = self.salida("push", "--yes")
+
+        self.assertEqual(self.transporte.escrituras(), [])
+        self.assertIn(diagnostico, self.estado(raiz)["documents"])
+        self.assertIn("todavía tiene páginas colgando", salida)
+
+    def test_borra_despues_de_subir_y_de_crear(self):
+        raiz = self.preparar()
+        self.editar_local(raiz, "diagnostico.md", "Una línea mía.")
+        self.crear_local(raiz, "presupuesto.md", "# Presupuesto\n\nLo que cuesta.\n")
+        (raiz / "wiki" / "albaran.md").unlink()
+
+        self.ejecutar("push", "--yes")
+
+        self.assertEqual(
+            [e for e, _ in self.transporte.escrituras()],
+            ["documents.update", "documents.create", "documents.move", "documents.delete"],
+        )
+
+    def test_sin_ficheros_que_falten_no_pregunta_nada(self):
+        self.preparar()
+
+        salida = self.salida("push")
+
+        self.assertNotIn("papelera", salida)
+
+
 class Marcadores(Caso):
     """En Markdown no hay compilador que avise, así que ningún comando escribe marcadores."""
 
@@ -1358,6 +1880,15 @@ class Diff(Caso):
         self.assertLess(salida.index("base -> local"), mio)
         self.assertLess(mio, salida.index("base -> remoto"))
         self.assertLess(salida.index("base -> remoto"), suyo)
+
+    def test_sigue_a_una_pagina_que_he_arrastrado_a_otra_carpeta(self):
+        raiz = self.montar_conflicto()
+        self.mover_fichero(raiz, "diagnostico.md", "albaran/diagnostico.md")
+
+        salida = self.salida("diff")
+
+        self.assertIn("wiki/albaran/diagnostico.md", salida)
+        self.assertIn("+Lo que escribí yo.", salida)
 
     def test_sin_conflictos_no_ensena_nada(self):
         self.proyecto("Taller")

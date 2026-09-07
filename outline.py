@@ -194,6 +194,31 @@ def section(title, pages):
     print()
 
 
+def ask(question):
+    """Lo que conteste la persona, o nada si no hay ninguna al teclado."""
+    if not sys.stdin.isatty():
+        return None
+    try:
+        return input(question)
+    except EOFError:
+        return None
+
+
+def agree(pages):
+    """Pide permiso para borrar, que es la operación que más duele si la lista no es la tuya."""
+    print("estas páginas están en el manifiesto del último pull y ya no están en el disco:")
+    for page in pages:
+        print(f"  {page}")
+    print()
+    print("borrarlas las manda a la papelera de Outline, así que hay vuelta atrás.")
+    answer = ask('escribe "si" para borrarlas: ')
+    if answer is None:
+        print("nadie contesta, así que no se borra nada. Con 'outline push --yes' se borran.")
+        return False
+    print()
+    return answer.strip().lower() in {"s", "si", "sí"}
+
+
 def frontmatter(document_id):
     return f"---\noutline_id: {document_id}\n---\n\n"
 
@@ -734,41 +759,50 @@ class Pusher:
     pages_by_path: dict
     uploaded: list = field(default_factory=list)
     created: list = field(default_factory=list)
+    moved: list = field(default_factory=list)
+    deleted: list = field(default_factory=list)
     clashed: list = field(default_factory=list)
     unsure: list = field(default_factory=list)
     rejected: list = field(default_factory=list)
+    unmoved: list = field(default_factory=list)
+    spared: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
     settled: int = 0
 
     def update(self, relative, document_id, entry):
-        """Sube una página que Outline ya conoce, si nadie se ha adelantado."""
+        """Sube una página que Outline ya conoce, si nadie se ha adelantado.
+
+        Devuelve si queda en un estado del que fiarse, que es lo que permite moverla después.
+        """
         local = self.mirror.bodies[relative]
-        base = self.shadowed.get(entry["path"] if entry else relative)
+        was_at = entry["path"] if entry else relative
+        base = self.shadowed.get(was_at)
         if local == base:
-            return
+            return True
         remote = fetch_document(self.client, document_id)
         if remote is None:
             self.unsure.append(f"wiki/{relative}, sin contenido accesible en Outline")
-            return
+            return False
         collection = self.scope.by_id(remote.get("collectionId"))
         if collection is None:
             self.unsure.append(
                 f"wiki/{relative}, en una colección fuera de {self.scope.label()}"
             )
-            return
+            return False
         remote_body = page_body(remote["title"], remote.get("text"))
         if local == remote_body:
-            remember(self.root, self.manifest, relative, remote, collection)
+            remember(self.root, self.manifest, was_at, remote, collection)
             self.settled += 1
-            return
+            return True
         if entry is None or base is None:
             self.unsure.append(
                 f"wiki/{relative}, sin base con la que comparar. "
                 "Acepta el estado de Outline con 'outline resolve' y vuelve a intentarlo"
             )
-            return
+            return False
         if advanced_by_revision(remote, entry, base, remote_body):
             self.clashed.append(f"wiki/{relative}")
-            return
+            return False
         title, body = split_title(local)
         payload = {"id": document_id, "text": body}
         if title:
@@ -776,9 +810,10 @@ class Pusher:
         document = (self.client.post("documents.update", payload) or {}).get("data")
         if document is None:
             self.unsure.append(f"wiki/{relative}, sin respuesta de Outline al escribirla")
-            return
-        remember(self.root, self.manifest, relative, document, collection)
+            return False
+        remember(self.root, self.manifest, was_at, document, collection)
         self.uploaded.append(f"wiki/{relative}")
+        return True
 
     def create(self, relative):
         """Crea en Outline una página que hasta ahora solo existía en el disco."""
@@ -834,6 +869,97 @@ class Pusher:
         )
         return moved or document
 
+    def nesting(self, relative):
+        """Dónde cuelga un fichero en Outline según su ruta: colección, ruta madre y su id."""
+        collection = collection_for(relative, self.scope)
+        parent = parent_path(relative, self.scope)
+        return collection, parent, (self.pages_by_path.get(parent) if parent else None)
+
+    def relocate(self, relative, document_id, was_at):
+        """Reanida en Outline una página cuyo fichero cambió de carpeta.
+
+        Devuelve si la ruta nueva se puede dar por buena, que es lo que deja apuntarla.
+        """
+        if was_at == relative:
+            return True
+        collection, parent, nest = self.nesting(relative)
+        if collection is None:
+            self.unmoved.append(f"wiki/{relative}, fuera de ninguna colección")
+            return False
+        if parent is not None and nest is None:
+            self.unmoved.append(
+                f"wiki/{relative}, que colgaría de wiki/{parent} y esa página no existe"
+            )
+            return False
+        before, _, previous = self.nesting(was_at)
+        if before is not None and before["id"] == collection["id"] and previous == nest:
+            return True
+        payload = {
+            "id": document_id,
+            "collectionId": collection["id"],
+            "index": level_size(relative, self.mirror),
+        }
+        if nest:
+            payload["parentDocumentId"] = nest
+        answer = (self.client.post("documents.move", payload) or {}).get("data") or {}
+        moved = next(
+            (d for d in answer.get("documents") or [] if d["id"] == document_id), None
+        )
+        entry = self.manifest[document_id]
+        # Mover sube la revisión aunque el texto no cambie, así que con la de antes el push
+        # siguiente vería un conflicto que no existe. Sin ella, la comparación cae al cuerpo.
+        entry["revision"] = moved.get("revision") if moved else None
+        entry["collection"] = collection["name"]
+        entry["collectionId"] = collection["id"]
+        self.moved.append(f"wiki/{relative}, desde wiki/{was_at}")
+        return True
+
+    def settle_path(self, document_id, relative, was_at):
+        """Muda la base con el fichero y apunta en el manifiesto dónde vive ahora."""
+        if was_at == relative:
+            return
+        base = self.root / STATE_DIR / "base"
+        if (base / was_at).is_file():
+            write(base / relative, (base / was_at).read_text(encoding="utf-8"))
+            if was_at not in self.mirror.bodies:
+                discard(base / was_at, base)
+        self.manifest[document_id]["path"] = relative
+
+    def remove(self, doomed, confirmed, complete):
+        """Borra las páginas que estaban en el manifiesto del último pull y ya no en el disco."""
+        pending = []
+        for document_id, entry in doomed:
+            folder = f"{entry['path'].removesuffix('.md')}/"
+            if any(other.startswith(folder) for other in self.mirror.bodies):
+                self.spared.append(
+                    f"wiki/{entry['path']}, que todavía tiene páginas colgando en el disco"
+                )
+            else:
+                pending.append((document_id, entry))
+        if not pending:
+            return
+        pages = [f"wiki/{entry['path']}" for _, entry in pending]
+        if not complete:
+            self.spared.extend(pages)
+            self.notes.append(
+                "no se borra nada porque el último pull no terminó: un fichero que falta "
+                "puede ser un fallo de red y no un borrado tuyo. Pasa un 'outline pull'."
+            )
+            return
+        if not confirmed and not agree(pages):
+            self.spared.extend(pages)
+            return
+        condemned = {document_id for document_id, _ in pending}
+        shadow_dir = self.root / STATE_DIR / "base"
+        for document_id, entry in pending:
+            parent = parent_path(entry["path"], self.scope)
+            # Outline se lleva a la papelera el árbol entero, así que con la madre basta.
+            if parent is None or self.pages_by_path.get(parent) not in condemned:
+                self.client.post("documents.delete", {"id": document_id, "permanent": False})
+            del self.manifest[document_id]
+            discard(shadow_dir / entry["path"], shadow_dir)
+            self.deleted.append(f"wiki/{entry['path']}")
+
     def tell(self):
         """Cuenta cómo fue la pasada y devuelve el código de salida."""
         partes = []
@@ -841,6 +967,10 @@ class Pusher:
             partes.append(plural(len(self.uploaded), "página subida", "páginas subidas"))
         if self.created:
             partes.append(plural(len(self.created), "creada", "creadas"))
+        if self.moved:
+            partes.append(plural(len(self.moved), "movida", "movidas"))
+        if self.deleted:
+            partes.append(plural(len(self.deleted), "borrada", "borradas"))
         if self.settled:
             partes.append(plural(self.settled, "ya estaba en Outline", "ya estaban en Outline"))
         if self.clashed:
@@ -849,23 +979,38 @@ class Pusher:
             partes.append(f"{len(self.unsure)} sin comparar")
         if self.rejected:
             partes.append(f"{len(self.rejected)} sin crear")
+        if self.unmoved:
+            partes.append(f"{len(self.unmoved)} sin mover")
+        if self.spared:
+            partes.append(f"{len(self.spared)} sin borrar")
         print(f"{', '.join(partes) or 'nada que subir'} en {self.scope.label()}")
         section("subidas", self.uploaded)
         section("creadas", self.created)
+        section("movidas", self.moved)
+        section("borradas, a la papelera de Outline", self.deleted)
         section("en conflicto, la remota se adelantó desde el último pull", self.clashed)
         section("sin comparar, así que no se han tocado", self.unsure)
         section("sin crear, porque la ruta o el fichero no dicen dónde va", self.rejected)
+        section("sin mover, porque la ruta nueva no dice dónde van", self.unmoved)
+        section("sin borrar, así que siguen en Outline", self.spared)
+        for note in self.notes:
+            print(note)
         if self.clashed:
             print(
                 "mira los dos diffs con 'outline diff', deja el fichero como quieras "
                 "y márcalo con 'outline resolve'."
             )
-        return 1 if self.clashed or self.unsure or self.rejected else 0
+        return (
+            1
+            if self.clashed or self.unsure or self.rejected or self.unmoved or self.spared
+            else 0
+        )
 
 
-def push(client, root, todas):
+def push(client, root, todas, confirmed=False):
     wiki = root / "wiki"
     state = load_state(root)
+    complete = state.get("pullComplete", False)
     manifest = state["documents"]
     mirror = Mirror.read(wiki)
     by_path = {entry["path"]: document_id for document_id, entry in manifest.items()}
@@ -875,7 +1020,7 @@ def push(client, root, todas):
     }
     refuse_duplicates(identity_of)
 
-    if not state.get("pullComplete", False):
+    if not complete:
         print(
             "aviso: el último pull no terminó del todo, así que la base puede estar a medias. "
             "Pasa un 'outline pull' antes de fiarte de lo que salga aquí."
@@ -893,7 +1038,17 @@ def push(client, root, todas):
         pages_by_path={**by_path, **mirror.ids},
     )
 
-    newborn = []
+    # Borrada es la que estaba en el manifiesto del último pull y ya no está en mi disco,
+    # nunca la que está en Outline y no en mi disco. Se apunta antes de crear nada, porque
+    # una página recién creada tampoco estaría en ese manifiesto.
+    alive = {document_id for document_id in identity_of.values() if document_id}
+    doomed = [
+        (document_id, dict(entry))
+        for document_id, entry in sorted(manifest.items(), key=lambda pair: pair[1]["path"])
+        if document_id not in alive and scope.covers(entry)
+    ]
+
+    newborn, movable = [], []
     for relative in sorted(mirror.bodies):
         document_id = identity_of[relative]
         if document_id is None:
@@ -901,14 +1056,22 @@ def push(client, root, todas):
             continue
         entry = manifest.get(document_id)
         if entry is None or scope.covers(entry):
-            pusher.update(relative, document_id, entry)
+            was_at = entry["path"] if entry else relative
+            if pusher.update(relative, document_id, entry) and entry is not None:
+                movable.append((relative, document_id, was_at))
 
     # De fuera hacia dentro, para que una hija encuentre a su madre recién creada.
     newborn.sort(key=lambda relative: (relative.count("/"), relative))
     for relative in newborn:
         pusher.create(relative)
 
-    write_manifest(root, manifest, complete=state.get("pullComplete", False))
+    # Después de crear, para que una página pueda mudarse debajo de otra recién nacida.
+    for relative, document_id, was_at in movable:
+        if pusher.relocate(relative, document_id, was_at):
+            pusher.settle_path(document_id, relative, was_at)
+
+    pusher.remove(doomed, confirmed, complete)
+    write_manifest(root, manifest, complete=complete)
     return pusher.tell()
 
 
@@ -930,6 +1093,12 @@ def diff(client, root, needles):
     manifest = load_manifest(root)
     mirror = Mirror.read(root / "wiki")
     shadowed = shadow(root / STATE_DIR / "base")
+    # Una página que has arrastrado a otra carpeta sigue siendo la misma, así que el diff
+    # la busca por identidad antes que por la ruta que el manifiesto todavía tiene.
+    located = {document_id: relative for relative, document_id in mirror.ids.items()}
+
+    def lives_at(document_id):
+        return located.get(document_id, manifest[document_id]["path"])
 
     if needles:
         targets = [find_page(root, manifest, needle) for needle in needles]
@@ -937,13 +1106,14 @@ def diff(client, root, needles):
         targets = [
             document_id
             for document_id, entry in manifest.items()
-            if mirror.bodies.get(entry["path"]) not in (None, shadowed.get(entry["path"]))
+            if mirror.bodies.get(lives_at(document_id))
+            not in (None, shadowed.get(entry["path"]))
         ]
 
     shown = 0
     for document_id in targets:
         entry = manifest[document_id]
-        local = mirror.bodies.get(entry["path"])
+        local = mirror.bodies.get(lives_at(document_id))
         base = shadowed.get(entry["path"])
         remote = fetch_document(client, document_id)
         remote_body = page_body(remote["title"], remote.get("text")) if remote else None
@@ -955,7 +1125,7 @@ def diff(client, root, needles):
         if not needles and not (local != base and theirs):
             continue
         shown += 1
-        print(f"wiki/{entry['path']}\n")
+        print(f"wiki/{lives_at(document_id)}\n")
         show_diff("base -> local, lo que has escrito tú", base, local, "local")
         show_diff("base -> remoto, lo que hay en Outline", base, remote_body, "remoto")
     if not needles and not shown:
@@ -1015,6 +1185,10 @@ def main(argv=None):
         "--all", dest="todas", action="store_true",
         help="trabaja con todas las colecciones en vez de la que se llama como el proyecto",
     )
+    parser.add_argument(
+        "--yes", dest="confirmado", action="store_true",
+        help="confirma el borrado de las páginas que ya no están en el disco",
+    )
     parser.add_argument("--url", help="dirección de la instancia. Por defecto, OUTLINE_URL")
     arguments = parser.parse_args(argv)
 
@@ -1025,7 +1199,7 @@ def main(argv=None):
     if arguments.command == "status":
         return status(client, root, arguments.todas)
     if arguments.command == "push":
-        return push(client, root, arguments.todas)
+        return push(client, root, arguments.todas, arguments.confirmado)
     if arguments.command == "diff":
         return diff(client, root, arguments.targets)
     if arguments.command == "resolve":

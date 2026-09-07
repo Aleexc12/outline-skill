@@ -48,7 +48,8 @@ sitio, apunta `OUTLINE_HOME` ahí.
 outline pull          # baja la colección que se llama como el proyecto
 outline pull --all    # baja todas las colecciones
 outline status        # qué has tocado tú y qué se ha movido en Outline
-outline push          # sube lo que has escrito, y crea las páginas nuevas
+outline push          # sube lo que has escrito, y crea, mueve y renombra
+outline push --yes    # además confirma los borrados
 outline diff "..."    # los dos lados de un conflicto, contra la base
 outline resolve "..." # da un conflicto por resuelto
 outline check "..."   # compara la revisión de una página con la del remoto
@@ -86,6 +87,27 @@ Sin `outline_id`, el `push` deduce la colección y la página padre de su ruta e
 crea al final de su nivel y escribe el identificador devuelto en el frontmatter del fichero.
 Así la jerarquía del disco y la de Outline son la misma cosa, y el título sale del encabezado
 de nivel 1, que viaja aparte del cuerpo para que no salga duplicado.
+
+Mover una página es arrastrar su `.md` a otra carpeta, y el `push` la reanida en Outline sin
+perder historial, comentarios ni enlaces.
+Un documento con hijas ocupa dos entradas, su propio `.md` y una carpeta hermana con el mismo
+nombre, así que hay que llevarse las dos.
+Renombrarla es cambiar su encabezado de nivel 1: el nombre del fichero sale de ese título, y lo
+ajusta el `pull` siguiente.
+
+Borrarla es borrar su fichero, y el `push` la manda a la papelera de Outline, de donde se
+recupera.
+Como es la operación que más duele si te equivocas, lleva cuatro barreras.
+El borrado se calcula como "estaba en el manifiesto del último `pull` y ya no está en el disco",
+nunca como "está en Outline y no en el disco", así que ni una colección fuera del ámbito ni una
+página que otra persona creó después de ese `pull` cuentan como borradas.
+Si el último `pull` no dejó la marca de completo, el `push` no borra: un fichero que falta puede
+ser un fallo de red.
+Antes de borrar lista las páginas afectadas y pide confirmación, y sin nadie al teclado no borra
+nada, así que hay que repetir con `outline push --yes`.
+Y la llamada va siempre a la papelera, nunca es permanente.
+Outline se lleva la rama entera, así que borrar una página con hijas es borrar también su
+carpeta; con hijas vivas en el disco el `push` no la borra y lo dice.
 
 Ante un conflicto, la herramienta nunca escribe marcadores dentro del fichero.
 En Markdown no hay compilador que avise, y un `<<<<<<<` que se escape acaba publicado en la
