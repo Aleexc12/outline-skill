@@ -46,6 +46,8 @@ Junto a `wiki/` queda `.outline/`, que es estado de la máquina y no se edita a 
 manifiesto con la revisión de cada página, la copia en la sombra del último `pull` en `base/`
 y ese índice.
 El `pull` lo actualiza a la vez que las páginas.
+Un hook corta cualquier comando que escriba ahí, así que si uno se bloquea es esto: rehaz el
+estado con `outline pull` en vez de arreglarlo a mano.
 
 ## Saber en qué estado estás
 

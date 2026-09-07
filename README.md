@@ -147,6 +147,39 @@ Se reconstruye con un `pull`, así que conviene añadirlo al `.gitignore` del pr
 - `index.md`, el árbol completo en el orden real de la barra lateral de Outline, que el árbol
   de directorios no guarda.
 
+## Proteger el estado de los agentes
+
+Tocar `.outline/` a mano rompe en silencio la detección de conflictos y las barreras del borrado.
+Un `deny` en la configuración de Claude Code cubre las herramientas de edición, pero no la shell,
+que es por donde un agente borra una carpeta.
+
+`guard.py` es un hook `PreToolUse` que lee el comando y lo para si escribe ahí.
+Deja pasar la lectura, que hace falta para el índice y el manifiesto.
+Se registra una vez en `~/.claude/settings.json` y vale para todos los proyectos:
+
+```json
+"hooks": {
+  "PreToolUse": [
+    {
+      "matcher": "Bash|PowerShell",
+      "hooks": [
+        { "type": "command", "command": "py \"<ruta>/guard.py\"", "timeout": 10 }
+      ]
+    }
+  ]
+}
+```
+
+Y en cada proyecto, para las herramientas de edición:
+
+```json
+"permissions": { "deny": ["Edit(/.outline/**)", "Write(/.outline/**)"] }
+```
+
+Esto para el accidente, no a alguien decidido: un hook que mira cadenas siempre se puede rodear.
+Lo que hay detrás como red de verdad es que `wiki/` va en git y que Outline guarda revisiones
+y papelera.
+
 ## Tests
 
 ```
