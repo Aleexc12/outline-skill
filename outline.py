@@ -240,6 +240,11 @@ def page_body(title, text):
     return f"# {title}\n\n{stripped}\n" if stripped else f"# {title}\n"
 
 
+def body_of(document):
+    """El cuerpo de un documento de la API tal y como se guarda en el disco."""
+    return page_body(document["title"], document.get("text"))
+
+
 def manifest_path(root):
     return root / STATE_DIR / "manifest.json"
 
@@ -754,10 +759,7 @@ def advanced_by_revision(remote, entry, base, remote_body):
 
 def remember(root, manifest, relative, document, collection):
     """Da la página por sincronizada, con la base en lo que Outline acaba de devolver."""
-    write(
-        root / STATE_DIR / "base" / relative,
-        page_body(document["title"], document.get("text")),
-    )
+    write(root / STATE_DIR / "base" / relative, body_of(document))
     manifest[document["id"]] = {
         "path": relative,
         "revision": document.get("revision"),
@@ -781,8 +783,8 @@ TALLIES = [
     Tally("uploaded", "página subida", "páginas subidas", "subidas"),
     Tally("created", "creada", "creadas", "creadas"),
     Tally("moved", "movida", "movidas", "movidas"),
-    Tally("reformatted", "reformateada por Outline", "reformateadas por Outline",
-          "reformateadas por Outline al guardarlas, así que su fichero local ha cambiado"),
+    Tally("reformatted", "con el fichero reescrito", "con los ficheros reescritos",
+          "reescritas en el disco, porque Outline no guarda el Markdown tal y como se lo mandas"),
     Tally("overtaken", "movida con la remota adelantada", "movidas con la remota adelantada",
           "movidas, pero Outline tiene texto que no has visto. Pásales un 'outline pull'"),
     Tally("deleted", "borrada", "borradas", "borradas, a la papelera de Outline"),
@@ -847,7 +849,7 @@ class Pusher:
                 f"wiki/{relative}, en una colección fuera de {self.scope.label()}"
             )
             return False
-        remote_body = page_body(remote["title"], remote.get("text"))
+        remote_body = body_of(remote)
         if local == remote_body:
             remember(self.root, self.manifest, was_at, remote, collection)
             self.settled.append(f"wiki/{relative}")
@@ -904,14 +906,14 @@ class Pusher:
         if document is None:
             self.rejected.append(f"wiki/{relative}, sin respuesta de Outline al crearla")
             return
-        document["revision"] = self.place_last(document, relative, collection, parent)
+        document["revision"] = self.move_to_end(document, relative, collection, parent)
         self.pages_by_path[relative] = document["id"]
-        self.settle_body(relative, document)
         remember(self.root, self.manifest, relative, document, collection)
+        self.settle_body(relative, document)
         self.created.append(f"wiki/{relative}")
 
-    def place_last(self, document, relative, collection, parent):
-        """Outline la cuelga al principio del nivel, y moverla al final sube su revisión."""
+    def move_to_end(self, document, relative, collection, parent):
+        """La baja al final de su nivel, donde va, y da la revisión que deja el movimiento."""
         movimiento = {
             "id": document["id"],
             "collectionId": collection["id"],
@@ -926,12 +928,13 @@ class Pusher:
         return (moved or document).get("revision")
 
     def settle_body(self, relative, document):
-        """Deja el fichero local con el texto que Outline ha guardado, que puede no ser el mío.
+        """Deja el fichero local con lo que Outline guardó, que no es siempre lo que le mandé.
 
-        Outline reescribe el Markdown a su forma canónica al guardarlo, y sin esto el fichero
-        no vuelve a coincidir con su base nunca más.
+        Sin esto, una página que Outline reformatea no vuelve a coincidir con su base.
         """
-        body = page_body(document["title"], document.get("text"))
+        if document.get("text") is None:
+            return
+        body = body_of(document)
         if self.mirror.bodies[relative] != body:
             self.mirror.bodies[relative] = body
             self.reformatted.append(f"wiki/{relative}")
@@ -978,7 +981,7 @@ class Pusher:
         if remote is None:
             self.unmoved.append(f"wiki/{relative}, sin contenido accesible en Outline")
             return False
-        remote_body = page_body(remote["title"], remote.get("text"))
+        remote_body = body_of(remote)
         overtaken = advanced_by_revision(remote, entry, bases.get(was_at), remote_body)
         payload = {
             "id": document_id,
@@ -1187,7 +1190,7 @@ def diff(client, root, needles):
         local = mirror.bodies.get(lives[document_id])
         base = shadowed.get(entry["path"])
         remote = fetch_document(client, document_id)
-        remote_body = page_body(remote["title"], remote.get("text")) if remote else None
+        remote_body = body_of(remote) if remote else None
         theirs = (
             remote is None
             or base is None
@@ -1224,10 +1227,7 @@ def resolve(client, root, needles):
         if remote is None:
             fail(f"Outline no devuelve contenido para wiki/{lives[document_id]}")
         # La base va a la ruta del manifiesto, que es contra la que compara el push.
-        write(
-            root / STATE_DIR / "base" / entry["path"],
-            page_body(remote["title"], remote.get("text")),
-        )
+        write(root / STATE_DIR / "base" / entry["path"], body_of(remote))
         entry["revision"] = remote.get("revision")
         entry.setdefault("collectionId", remote.get("collectionId"))
         manifest[document_id] = entry

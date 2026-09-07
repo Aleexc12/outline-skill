@@ -99,9 +99,10 @@ El cuerpo que se manda no lleva el frontmatter ni repite el título.
 El identificador de una página recién creada vuelve al frontmatter del fichero local.
 El `push` nunca escribe marcadores de conflicto dentro de un fichero.
 
-Outline reescribe el Markdown al guardarlo: junta los saltos de línea sueltos dentro de un
-párrafo y normaliza el separador de las tablas.
-El `push` deja el fichero local con lo que Outline devuelve, y lista las páginas reformateadas.
+Outline reescribe el Markdown al guardarlo.
+Junta los saltos de línea sueltos dentro de un párrafo, y a veces también reescribe las tablas.
+El `push` deja el fichero local con lo que Outline devuelve, y lista los ficheros que ha
+reescrito.
 Sin eso, una página escrita con una frase por línea se subiría en todas las pasadas y el `pull`
 dejaría de traer lo que otros escriban en ella.
 

@@ -49,6 +49,7 @@ class Transporte:
         self.destruidos = []
         self.mudos = set()
         self.canonica = None
+        self.sin_texto = set()
         self.creados = 0
         for indice, (nombre, nodos) in enumerate(arbol.items(), start=1):
             coleccion = f"col-{indice}"
@@ -112,7 +113,7 @@ class Transporte:
             documento["revision"] += 1
             if payload.get("title"):
                 self.retitular(payload["id"], payload["title"])
-            return {"data": dict(documento)}
+            return {"data": self._respuesta(documento)}
         if endpoint == "documents.create":
             padre = payload.get("parentDocumentId")
             coleccion = payload.get("collectionId") or self.documentos[padre]["collectionId"]
@@ -153,6 +154,13 @@ class Transporte:
                 self.arboles[coleccion] = self._podar(arbol, payload["id"])
             return {"data": None}
         raise AssertionError(f"endpoint no guionizado: {endpoint}")
+
+    def _respuesta(self, documento):
+        """Outline contesta con el documento guardado, y a veces sin el texto."""
+        salida = dict(documento)
+        if documento["id"] in self.sin_texto:
+            salida.pop("text")
+        return salida
 
     def _guardar(self, texto):
         """Outline no guarda el Markdown tal cual, sino su forma canónica."""
@@ -1394,8 +1402,13 @@ class Push(Caso):
 
 
 def canonica(texto):
-    """Lo que hace el editor de Outline al guardar: junta los saltos sueltos de un párrafo."""
-    return "\n\n".join(" ".join(parrafo.split("\n")) for parrafo in texto.split("\n\n"))
+    """Lo que Outline hace al guardar: junta los saltos sueltos y aprieta las tablas."""
+    bloques = [
+        re.sub(r"-{2,}", "---", parrafo) if parrafo.lstrip().startswith("|")
+        else " ".join(parrafo.split("\n"))
+        for parrafo in texto.split("\n\n")
+    ]
+    return "\n\n".join(bloques)
 
 
 class PushReformatea(Caso):
@@ -1408,15 +1421,9 @@ class PushReformatea(Caso):
         self.transporte.peticiones.clear()
         return raiz
 
-    def partir_en_lineas(self, raiz, ruta):
-        """Escribe una frase por línea, que es como Outline no lo guarda."""
-        pagina = raiz / "wiki" / ruta
-        texto = pagina.read_text(encoding="utf-8").rstrip("\n") + "\n\nUna frase.\nY otra.\n"
-        pagina.write_text(texto, encoding="utf-8")
-
     def test_el_fichero_local_se_queda_con_lo_que_outline_guarda(self):
         raiz = self.preparar()
-        self.partir_en_lineas(raiz, "diagnostico.md")
+        self.editar_local(raiz, "diagnostico.md", "Una frase.\nY otra.")
 
         self.ejecutar("push")
 
@@ -1425,7 +1432,7 @@ class PushReformatea(Caso):
     def test_el_fichero_local_conserva_su_frontmatter(self):
         raiz = self.preparar()
         identificador = self.identificador(raiz, "diagnostico.md")
-        self.partir_en_lineas(raiz, "diagnostico.md")
+        self.editar_local(raiz, "diagnostico.md", "Una frase.\nY otra.")
 
         self.ejecutar("push")
 
@@ -1435,7 +1442,7 @@ class PushReformatea(Caso):
 
     def test_la_pagina_queda_limpia(self):
         raiz = self.preparar()
-        self.partir_en_lineas(raiz, "diagnostico.md")
+        self.editar_local(raiz, "diagnostico.md", "Una frase.\nY otra.")
 
         self.ejecutar("push")
 
@@ -1449,7 +1456,7 @@ class PushReformatea(Caso):
 
     def test_el_push_siguiente_no_la_vuelve_a_subir(self):
         raiz = self.preparar()
-        self.partir_en_lineas(raiz, "diagnostico.md")
+        self.editar_local(raiz, "diagnostico.md", "Una frase.\nY otra.")
         self.ejecutar("push")
         self.transporte.peticiones.clear()
 
@@ -1457,9 +1464,19 @@ class PushReformatea(Caso):
 
         self.assertEqual(self.transporte.escrituras(), [])
 
+    def test_una_tabla_apretada_por_outline_tambien_converge(self):
+        raiz = self.preparar()
+        tabla = "| Cosa | Estado |\n|------|--------|\n| ciclo | va |"
+        self.editar_local(raiz, "albaran.md", tabla)
+
+        self.ejecutar("push")
+
+        self.assertIn("|---|---|", self.pagina(raiz, "albaran.md"))
+        self.assertIn("0 sucias", self.salida("status"))
+
     def test_el_pull_siguiente_se_trae_lo_que_escribio_mi_socia(self):
         raiz = self.preparar()
-        self.partir_en_lineas(raiz, "diagnostico.md")
+        self.editar_local(raiz, "diagnostico.md", "Una frase.\nY otra.")
         self.ejecutar("push")
         self.transporte.editar(
             self.identificador(raiz, "diagnostico.md"), "Lo que escribió mi socia."
@@ -1479,13 +1496,22 @@ class PushReformatea(Caso):
         self.assertIn("Una frase. Y otra.", self.pagina(raiz, "presupuesto.md"))
         self.assertIn("0 sucias", self.salida("status"))
 
-    def test_el_resumen_dice_que_outline_reformateo_el_fichero(self):
+    def test_una_respuesta_sin_texto_no_vacia_el_fichero(self):
         raiz = self.preparar()
-        self.partir_en_lineas(raiz, "diagnostico.md")
+        self.transporte.sin_texto.add(self.identificador(raiz, "diagnostico.md"))
+        mio = self.editar_local(raiz, "diagnostico.md", "Una frase.\nY otra.")
+
+        self.ejecutar("push")
+
+        self.assertEqual(self.pagina(raiz, "diagnostico.md"), mio)
+
+    def test_el_resumen_dice_que_el_fichero_local_ha_cambiado(self):
+        raiz = self.preparar()
+        self.editar_local(raiz, "diagnostico.md", "Una frase.\nY otra.")
 
         salida = self.salida("push")
 
-        self.assertIn("reformateada", salida)
+        self.assertIn("reescrit", salida)
         self.assertIn("wiki/diagnostico.md", salida)
 
     def test_lo_que_outline_guarda_tal_cual_no_se_anuncia(self):
@@ -1494,7 +1520,7 @@ class PushReformatea(Caso):
 
         salida = self.salida("push")
 
-        self.assertNotIn("reformateada", salida)
+        self.assertNotIn("reescrit", salida)
 
 
 class PushMueve(Caso):

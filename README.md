@@ -82,13 +82,13 @@ escribiendo a ritmo humano y Outline guarda el historial de revisiones de cada p
 Si el último `pull` no llegó a terminar, el `push` avisa antes de nada, porque entonces la base
 puede estar a medias.
 
-Outline no guarda el Markdown tal y como se lo mandas: junta los saltos de línea sueltos dentro
-de un párrafo y normaliza el separador de las tablas.
-Por eso el `push` deja el fichero local con el texto que Outline devuelve, y lista las páginas
-que te ha reformateado.
-Si no lo hiciera, esas páginas no volverían a coincidir con su base: saldrían sucias en todos
-los `status`, se resubirían en todos los `push` y el `pull` nunca te traería lo que un socio
-escriba en ellas.
+Outline no guarda el Markdown tal y como se lo mandas.
+Junta los saltos de línea sueltos dentro de un párrafo, y a veces también reescribe las tablas.
+Por eso el `push` deja el fichero local con el texto que Outline devuelve, y lista aparte las
+páginas cuyo fichero ha cambiado.
+Si no lo hiciera, esas páginas no volverían a coincidir con su base.
+Saldrían sucias en todos los `status`, se resubirían en todos los `push` quemando una revisión
+cada vez, y el `pull` nunca te traería lo que un socio escriba en ellas.
 
 Una página nueva es un `.md` nuevo en la carpeta que le toca.
 Sin `outline_id`, el `push` deduce la colección y la página padre de su ruta en el disco, la
