@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+home="${OUTLINE_HOME:-$HOME/.claude/skills/wiki}"
+exec py "$home/outline.py" "$@"
